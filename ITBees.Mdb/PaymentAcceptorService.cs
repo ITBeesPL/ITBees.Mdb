@@ -1,80 +1,10 @@
-﻿using System.IO.Ports;
-
-namespace ITBees.Mdb
+﻿namespace ITBees.Mdb
 {
     using System;
     using System.Threading;
     using System.Threading.Tasks;
 
-    public enum DeviceEventType
-    {
-        CashEscrowRequested,
-        CashProcessed,
-        CoinReceived,
-        CoinProcessed,
-        Error,
-        Initialized
-    }
-
-    public enum PaymentType { Cash, Coin }
-
-    public class DeviceEventArgs : EventArgs
-    {
-        public DeviceEventType EventType { get; }
-        public PaymentType PaymentType { get; }
-        public int Amount { get; }
-        public bool? Accepted { get; }
-        public string Message { get; }
-
-        public DeviceEventArgs(DeviceEventType evt, PaymentType type, int amount = 0, bool? accepted = null, string message = null)
-        {
-            EventType = evt;
-            PaymentType = type;
-            Amount = amount;
-            Accepted = accepted;
-            Message = message;
-        }
-    }
-
-    public interface ISerialDevice : IDisposable
-    {
-        void Open();
-        void Close();
-        bool IsOpen { get; }
-        void Write(string data);
-        string Read();
-    }
-
-    public class SerialPortDevice : ISerialDevice
-    {
-        private readonly SerialPort _port;
-        public SerialPortDevice(string portName, int baudRate = 115200, int timeout = 1000)
-        {
-            _port = new SerialPort(portName, baudRate)
-            {
-                ReadTimeout = timeout,
-                WriteTimeout = timeout
-            };
-        }
-        public bool IsOpen => _port.IsOpen;
-        public void Open() => _port.Open();
-        public void Close() => _port.Close();
-        public void Write(string data)
-        {
-            if (!_port.IsOpen)
-                throw new InvalidOperationException("Port is not open");
-            _port.WriteLine(data);
-            Thread.Sleep(50);
-        }
-        public string Read()
-        {
-            try { return _port.ReadLine().Trim(); }
-            catch (TimeoutException) { return string.Empty; }
-        }
-        public void Dispose() => Close();
-    }
-
-    public class PaymentAcceptorService
+    public class PaymentAcceptorService : IPaymentAcceptorService
     {
         private readonly ISerialDevice _device;
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
@@ -82,18 +12,19 @@ namespace ITBees.Mdb
         private CancellationTokenSource _cts;
         private TaskCompletionSource<bool> _escrowDecision;
 
-        public event EventHandler<DeviceEventArgs> DeviceEvent;
+        public event EventHandler<DeviceEventArgs>? DeviceEvent;
 
         public PaymentAcceptorService(ISerialDevice device)
         {
             _device = device;
         }
 
-        public void Start()
+        public void Start(string portName)
         {
             try
             {
-                _device.Open();
+                _device.PrepareSerialPortDevice(portName, 115200, 1000);
+                
                 InitDevices();
                 _cts = new CancellationTokenSource();
                 _ = PollLoop(_cts.Token);
