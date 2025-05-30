@@ -6,7 +6,8 @@ namespace TestMdbConsoleApp
     {
         static void Main(string[] args)
         {
-            using var device = new SerialPortDevice("COM3", 115200, 1000);
+            using var device = new SerialPortDevice();
+            
             var service = new PaymentAcceptorService(device);
 
             service.DeviceEvent += (s, e) =>
@@ -35,7 +36,7 @@ namespace TestMdbConsoleApp
                 }
             };
 
-            service.Start();
+            service.Start("COM3");
 
             Console.WriteLine("Hit enter to quit");
 
