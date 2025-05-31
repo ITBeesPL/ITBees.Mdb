@@ -42,9 +42,16 @@ namespace TestMdbConsoleApp
                 }
             };
 
-            service.Start("COM3");
+            var portName = "COM3";
+            service.Start(portName);
 
-            Console.WriteLine("Hit enter to quit");
+            Console.WriteLine("Commands:");
+            Console.WriteLine("A - Accept banknote");
+            Console.WriteLine("S - Show tube status");
+            Console.WriteLine("D - Dispense coin");
+            Console.WriteLine("Q - Stop mdb service");
+            Console.WriteLine("E - Enable mdb service");
+            Console.WriteLine("T - Enable mdb service");
 
             while (true)
             {
@@ -54,6 +61,10 @@ namespace TestMdbConsoleApp
                     Console.WriteLine($"Pressed key : {key}");
                     if (key == ConsoleKey.A)
                         service.Accept();
+                    if (key == ConsoleKey.Q)
+                        service.Stop();
+                    if (key == ConsoleKey.E)
+                        service.Start(portName);
                     if (key == ConsoleKey.S)
                         service.ShowTubeStatus();
                     if (key == ConsoleKey.D)
