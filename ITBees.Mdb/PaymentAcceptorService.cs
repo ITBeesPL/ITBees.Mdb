@@ -1,4 +1,6 @@
-﻿namespace ITBees.Mdb
+﻿using System.Threading.Channels;
+
+namespace ITBees.Mdb
 {
     using System;
     using System.Threading;
@@ -120,13 +122,20 @@
 
         private int? TryParseBill(string data)
         {
-            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK")) return null;
+            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK"))
+                return null;
+
+            string hex = data.Replace("p,", string.Empty);
+            if (hex.Length != 2)                    
+                return null;                        
+
             try
             {
-                int v = Convert.ToInt32(data.Replace("p,", string.Empty), 16);
-                int r = (v & 0xF0) >> 4;
-                int t = v & 0x0F;
-                if (r == 9 && t < _billValues.Length) return _billValues[t];
+                int v = Convert.ToInt32(hex, 16);
+                int route = (v & 0xF0) >> 4;
+                int type = v & 0x0F;
+                if (route == 9 && type < _billValues.Length)
+                    return _billValues[type];
             }
             catch (Exception ex) { EmitError("ParseBill: " + ex.Message); }
             return null;
@@ -134,19 +143,90 @@
 
         private int? TryParseCoin(string data)
         {
-            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK")) return null;
+            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK"))
+                return null;
+
+            string hex = data.Replace("p,", string.Empty);
+            if (hex.Length != 4)                    
+                return null;                        
+
             try
             {
-                // MDB: p,HHLL (hex)
-                Console.WriteLine(data);
-                int raw = Convert.ToInt32(data.Replace("p,", string.Empty), 16);
+                int raw = Convert.ToInt32(hex, 16);
                 int high = (raw >> 8) & 0xFF;
                 int routing = (high & 0xC0) >> 6;
                 int type = high & 0x3F;
-                if (routing == 0 && type < _coinValues.Length) return _coinValues[type];
+                if (routing == 0 && type < _coinValues.Length)
+                    return _coinValues[type];
             }
             catch (Exception ex) { EmitError("ParseCoin: " + ex.Message); }
             return null;
+        }
+        public Dictionary<int, int> GetCoinTubeStatus()
+        {
+            try
+            {
+                _device.Write("R,0A");          // MDB Tube Status (0x0A)
+                var resp = _device.Read();      // np. "p,0000A1050302010000..."
+                Console.WriteLine(resp);
+                return ParseTubeStatus(resp);
+            }
+            catch (Exception ex)
+            {
+                EmitError("TubeStatus: " + ex.Message);
+                return new Dictionary<int, int>();
+            }
+        }
+
+        public void ShowTubeStatus()
+        {
+            var tubes = GetCoinTubeStatus();
+            if (tubes.Count == 0)
+            {
+                Console.WriteLine("Brak danych o tubach");
+                return;
+            }
+
+            Console.WriteLine("Stan zasobników:");
+            foreach (var kv in tubes)
+                Console.WriteLine($"  {kv.Key} gr: {kv.Value} szt.");
+        }
+
+        
+        public bool DispenseCoin(int coinValue)
+        {
+            int idx = Array.IndexOf(_coinValues, coinValue);
+            if (idx < 0 || idx > 0x0F) return false;
+
+            byte param = (byte)((1 << 4) | idx);         
+            string cmd = $"R,0D,{param:X2}";         
+            _device.Write(cmd);
+            var resp = _device.Read();                   
+            return resp?.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase) == true;
+        }
+
+
+        private Dictionary<int, int> ParseTubeStatus(string data)
+        {
+            var result = new Dictionary<int, int>();
+
+            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK")) return result;
+
+            try
+            {        
+                string hex = data.Replace("p,", string.Empty);
+                byte[] bytes = Enumerable.Range(0, hex.Length / 2)
+                    .Select(i => Convert.ToByte(hex.Substring(i * 2, 2), 16))
+                    .ToArray();
+
+                if (bytes.Length < 18) return result;     
+
+                for (int i = 0; i < _coinValues.Length && (2 + i) < bytes.Length; i++)
+                    result[_coinValues[i]] = bytes[2 + i];
+            }
+            catch (Exception ex) { EmitError("ParseTubeStatus: " + ex.Message); }
+
+            return result;
         }
     }
 }

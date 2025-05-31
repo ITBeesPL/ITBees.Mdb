@@ -45,8 +45,16 @@ namespace TestMdbConsoleApp
                 if (Console.KeyAvailable)
                 {
                     var key = Console.ReadKey(true).Key;
+                    Console.WriteLine($"Pressed key : {key}");
                     if (key == ConsoleKey.A)
                         service.Accept();
+                    if (key == ConsoleKey.S)
+                        service.ShowTubeStatus();
+                    if (key == ConsoleKey.D)
+                    {
+                        string coinValue = Console.ReadLine();
+                        service.DispenseCoin(Convert.ToInt32(coinValue.Trim()));
+                    }
                     else if (key == ConsoleKey.R)
                         service.Return();
                     else if (key == ConsoleKey.Escape)
