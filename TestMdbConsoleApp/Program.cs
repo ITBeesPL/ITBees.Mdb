@@ -33,6 +33,12 @@ namespace TestMdbConsoleApp
                     case DeviceEventType.Error:
                         Console.WriteLine($"Error: {e.Message}");
                         break;
+                    case DeviceEventType.CoinDispensed:
+                        Console.WriteLine($"Dispensed Coin: {e.Amount}.");
+                        break;
+                    case DeviceEventType.CoinToCashbox:
+                        Console.WriteLine($"Coin to cashbox: {e.Amount}.");
+                        break;
                 }
             };
 
@@ -53,6 +59,8 @@ namespace TestMdbConsoleApp
                     if (key == ConsoleKey.D)
                     {
                         string coinValue = Console.ReadLine();
+                        if(coinValue.Trim() == String.Empty)
+                            return;
                         service.DispenseCoin(Convert.ToInt32(coinValue.Trim()));
                     }
                     else if (key == ConsoleKey.R)

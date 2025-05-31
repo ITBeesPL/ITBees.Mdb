@@ -1,4 +1,5 @@
-﻿using System.IO.Ports;
+﻿using System.Diagnostics;
+using System.IO.Ports;
 
 namespace ITBees.Mdb;
 
@@ -26,7 +27,11 @@ public class SerialPortDevice : ISerialDevice
     public void Write(string data)
     {
         if (!_port.IsOpen)
-            throw new InvalidOperationException("Port is not open");
+        {
+            Debug.WriteLine("Port is not open");
+            return;
+        }
+            
         _port.WriteLine(data);
         Thread.Sleep(50);
     }

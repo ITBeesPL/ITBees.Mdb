@@ -7,5 +7,7 @@ public enum DeviceEventType
     CoinReceived,
     CoinProcessed,
     Error,
-    Initialized
+    Initialized,
+    CoinDispensed,
+    CoinToCashbox
 }
