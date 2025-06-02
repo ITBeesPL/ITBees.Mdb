@@ -7,4 +7,5 @@ public interface IPaymentAcceptorService
     void Stop();
     void Accept();
     void Return();
+    bool DispenseChange(int amount);
 }

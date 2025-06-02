@@ -9,5 +9,8 @@ public enum DeviceEventType
     Error,
     Initialized,
     CoinDispensed,
-    CoinToCashbox
+    CoinToCashbox,
+    CashlessSessionStarted,
+    CashlessVendApproved,
+    CashlessVendDenied
 }
