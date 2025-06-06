@@ -42,12 +42,11 @@ namespace ITBees.Mdb
             {
                 _device.Write("M,0");
                 ReadLineLogged();
+                _device.Close();
             }
             catch
             {
             }
-
-            _device.Close();
         }
 
         private void Prepare(string port)

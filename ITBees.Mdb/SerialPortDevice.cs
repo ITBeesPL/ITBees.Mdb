@@ -1,12 +1,18 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Ports;
-using System.Threading;
+using Microsoft.Extensions.Logging;
 
 namespace ITBees.Mdb
 {
     public sealed class SerialPortDevice : ISerialDevice, IDisposable
     {
+        private readonly ILogger<SerialPortDevice> _logger;
+
+        public SerialPortDevice(ILogger<SerialPortDevice> logger)
+        {
+            _logger = logger;
+        }
+
         private SerialPort? _port;
 
         /* ------------------------------------------------------------
@@ -15,16 +21,23 @@ namespace ITBees.Mdb
 
         /// <summary>Open and configure the port in one call.</summary>
         public void PrepareSerialPortDevice(string port,
-                                            int baud = 115200,
-                                            int timeout = 1000)
+            int baud = 115200,
+            int timeout = 1000)
         {
-            _port = new SerialPort(port, baud)
+            try
             {
-                NewLine = "\r",   // read until CR (no LF)
-                ReadTimeout = timeout,
-                WriteTimeout = timeout
-            };
-            _port.Open();
+                _port = new SerialPort(port, baud)
+                {
+                    NewLine = "\r", // read until CR (no LF)
+                    ReadTimeout = timeout,
+                    WriteTimeout = timeout
+                };
+                _port.Open();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, e.Message);
+            }
         }
 
         /// <summary>True when the underlying SerialPort is open.</summary>
@@ -33,29 +46,53 @@ namespace ITBees.Mdb
         /// <summary>Open an already configured SerialPort.</summary>
         public void Open(string portName)
         {
-            if (_port == null)
-                PrepareSerialPortDevice(portName);
-            else
+            try
             {
-                _port.PortName = portName;
-                if (!_port.IsOpen) _port.Open();
+                if (_port == null)
+                    PrepareSerialPortDevice(portName);
+                else
+                {
+                    _port.PortName = portName;
+                    if (!_port.IsOpen) _port.Open();
+                }
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, e.Message);
             }
         }
 
         /// <summary>Close the port if it is open.</summary>
         public void Close()
         {
-            try { _port?.Close(); }
-            catch { /* ignore */ }
+            try
+            {
+                _port?.Close();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, e.Message);
+            }
         }
 
         /// <summary>Write ASCII command + single CR (0x0D).</summary>
         public void Write(string ascii)
         {
-            if (!IsOpen) { Debug.WriteLine("SerialPort closed"); return; }
+            try
+            {
+                if (!IsOpen)
+                {
+                    Debug.WriteLine("SerialPort closed");
+                    return;
+                }
 
-            _port!.Write(ascii + "\r");        // <CR> terminator
-            Thread.Sleep(20);                  // small gap for some bridges
+                _port!.Write(ascii + "\r"); // <CR> terminator
+                Thread.Sleep(20); // small gap for some bridges
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, e.Message);
+            }
         }
 
         /// <summary>Read one line (up to CR). Returns empty on timeout.</summary>
@@ -63,8 +100,14 @@ namespace ITBees.Mdb
         {
             if (!IsOpen) return string.Empty;
 
-            try { return _port!.ReadLine().Trim(); }
-            catch (TimeoutException) { return string.Empty; }
+            try
+            {
+                return _port!.ReadLine().Trim();
+            }
+            catch (TimeoutException)
+            {
+                return string.Empty;
+            }
         }
 
         /* ------------------------------------------------------------
