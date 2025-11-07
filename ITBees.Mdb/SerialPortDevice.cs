@@ -36,7 +36,7 @@ namespace ITBees.Mdb
             }
             catch (Exception e)
             {
-                _logger.LogError(e, e.Message);
+                _logger.LogError(e,"Prepare serial port device  error : " + e.Message);
             }
         }
 
