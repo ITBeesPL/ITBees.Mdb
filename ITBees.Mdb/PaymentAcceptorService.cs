@@ -1,34 +1,35 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 
 namespace ITBees.Mdb
 {
     public class PaymentAcceptorService : IPaymentAcceptorService
     {
         private readonly ISerialDevice _device;
+        private readonly ILogger<PaymentAcceptorService> _logger;
 
-        /* ---------- static tables ---------------------------------- */
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
-        private readonly int[] _tubeValues = { 10, 20, 50, 100, 200, 500 };
 
-        private readonly Dictionary<int, int> _coinMap = new()
-        {
-            { 16, 10 }, { 17, 20 }, { 18, 50 },
-            { 19, 100 }, { 20, 200 }, { 21, 500 }
-        };
+        private readonly Dictionary<int, int> _coinTypeToValue = new();
+        private readonly Dictionary<int, int> _coinValueToType = new();
 
-        /* ---------- runtime fields --------------------------------- */
+        private int _coinScalingFactor = 1;
+        private int _coinDecimalPlaces = 2;
+
         private CancellationTokenSource _cts;
         private TaskCompletionSource<bool> _escrowDecision;
         private volatile bool _cashlessBusy;
 
         public event EventHandler<DeviceEventArgs>? DeviceEvent;
 
-        public PaymentAcceptorService(ISerialDevice device) => _device = device;
+        public PaymentAcceptorService(ISerialDevice device, ILogger<PaymentAcceptorService> logger)
+        {
+            _device = device;
+            _logger = logger;
+        }
 
-        /* ============================================================ */
-        /*  LIFECYCLE                                                   */
-        /* ============================================================ */
         public void Start(string port)
         {
             Prepare(port);
@@ -56,27 +57,25 @@ namespace ITBees.Mdb
             _cts = new CancellationTokenSource();
         }
 
-        /* ============================================================ */
-        /*  DEVICE INITIALISATION                                       */
-        /* ============================================================ */
         private void InitDevices()
         {
-            // Master reset (M,1)
             _device.Write("M,1");
             ReadLineLogged();
 
-            // Inicjalizacja valid <banknotów>
             foreach (var cmd in new[] { "R,30", "R,31", "R,34,FFFFFFFF", "R,35,0" })
             {
                 _device.Write(cmd);
                 ReadLineLogged();
             }
 
-            // Inicjalizacja <monet>
             foreach (var cmd in new[] { "R,08", "R,09", "R,0C,FFFFFFFF" })
             {
                 _device.Write(cmd);
-                ReadLineLogged();
+                var line = ReadLineLogged();
+                if (cmd == "R,09")
+                {
+                    LoadCoinConfiguration(line);
+                }
             }
 
             DeviceEvent?.Invoke(this,
@@ -84,9 +83,6 @@ namespace ITBees.Mdb
                     PaymentType.Cash, 0, null, "Initialized"));
         }
 
-        /* ============================================================ */
-        /*  MAIN POLL LOOP                                              */
-        /* ============================================================ */
         private async Task PollLoop()
         {
             while (!_cts.IsCancellationRequested)
@@ -95,11 +91,9 @@ namespace ITBees.Mdb
                 {
                     if (!_cashlessBusy)
                     {
-                        // Polluj banknoty (R,33)
                         _device.Write("R,33");
                         HandleBills(ReadLineLogged());
 
-                        // Polluj monety (R,0B)
                         _device.Write("R,0B");
                         HandleCoins(ReadLineLogged());
                     }
@@ -113,7 +107,6 @@ namespace ITBees.Mdb
             }
         }
 
-        /* ---------- bill helper (wrapper previously missing) -------- */
         private async void HandleBills(string data)
         {
             if (TryParseBill(data) is int amt)
@@ -122,9 +115,6 @@ namespace ITBees.Mdb
             }
         }
 
-        /* ============================================================ */
-        /*  BILL ESCROW HANDLING                                        */
-        /* ============================================================ */
         private async Task HandleBillAsync(int amt, CancellationToken token)
         {
             _escrowDecision = new TaskCompletionSource<bool>();
@@ -139,7 +129,6 @@ namespace ITBees.Mdb
             if (finished != _escrowDecision.Task)
                 EmitError("Escrow timeout – returning note");
 
-            // zaakceptuj lub zwróć banknot
             _device.Write($"R,35,{(accept ? 1 : 0)}");
             ReadLineLogged();
             DeviceEvent?.Invoke(this,
@@ -147,18 +136,13 @@ namespace ITBees.Mdb
                     PaymentType.Cash, amt, accept));
         }
 
-        /* ============================================================ */
-        /*  COIN PARSING                                                */
-        /* ============================================================ */
         private static readonly Regex _frame4 = new(@"[0-9A-Fa-f]{4}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
         private void HandleCoins(string data)
         {
-            // zwracamy tylko ramki zaczynające się od "p,"
             if (string.IsNullOrEmpty(data) || !data.StartsWith("p,")) return;
 
-            // usuń przedrostek "p," i pozostaw same znaki heksadecymalne
             string hex = new string(data.Substring(2)
                 .Where(c => IsHex(c))
                 .ToArray());
@@ -167,82 +151,90 @@ namespace ITBees.Mdb
                 ProcessSingleCoinFrame(m.Value);
         }
 
-        private void ProcessSingleCoinFrame(string hex)
+        private void ProcessSingleCoinFrame(string frame)
+        {
+            if (string.IsNullOrWhiteSpace(frame) || frame.Length != 4)
+                return;
+
+            byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
+            byte b2 = Convert.ToByte(frame.Substring(2, 2), 16);
+
+            int routing = (b1 >> 4) & 0b11;
+            int coinType = b1 & 0b1111;
+
+            _logger.LogDebug("[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} routing={Routing} coinType={CoinType}",
+                frame, b1, b2, routing, coinType);
+
+            if (routing == 0b11)
+            {
+                _logger.LogInformation("[MDB COIN] coin rejected, type={CoinType}, frame={Frame}", coinType, frame);
+                return;
+            }
+
+            if (!_coinTypeToValue.TryGetValue(coinType, out var amountInCents))
+            {
+                _logger.LogWarning("[MDB COIN] unknown coin type={CoinType}, frame={Frame}", coinType, frame);
+                return;
+            }
+
+            var evt = new DeviceEventArgs(
+                DeviceEventType.CoinReceived,
+                PaymentType.Coin,
+                amountInCents,
+                targetCashHolder: routing == 0b00
+                    ? DeviceEventType.CoinToCashbox
+                    : DeviceEventType.CoinReceived);
+
+            DeviceEvent?.Invoke(this, evt);
+        }
+        public void ResetDeviceCoinState()
         {
             try
             {
-                int raw = Convert.ToInt32(hex, 16);
-                int high = (raw >> 8) & 0xFF;
-                int route = (high & 0xC0) >> 6; // 0=tube, 1=cashbox, 2=payout
-                int type = high & 0x3F;
+                _device.Write("R,08");
+                ReadLineLogged();
 
-                if (!_coinMap.TryGetValue(type, out int amount))
-                {
-                    // nieznany typ monety → pomiń
-                    return;
-                }
+                _device.Write("R,09");
+                ReadLineLogged();
 
-                switch (route)
-                {
-                    case 0: // przyjęto do tuby
-                    case 1: // przyjęto do cashboxa
-                        DeviceEvent?.Invoke(this,
-                            new DeviceEventArgs(DeviceEventType.CoinReceived,
-                                PaymentType.Coin, amount));
-                        DeviceEvent?.Invoke(this,
-                            new DeviceEventArgs(DeviceEventType.CoinProcessed,
-                                PaymentType.Coin, amount, true));
-                        break;
-                    case 2: // wypłacono monetę
-                        DeviceEvent?.Invoke(this,
-                            new DeviceEventArgs(DeviceEventType.CoinDispensed,
-                                PaymentType.Coin, amount));
-                        break;
-                }
+                _device.Write("R,0C,FFFFFFFF");
+                ReadLineLogged();
+
+                _logger.LogInformation("MDB coin device reset/reinitialized after emptying tubes.");
             }
-            catch
+            catch (Exception ex)
             {
-                // błędy parsowania ignorujemy
+                EmitError("Error while resetting MDB coin device: " + ex.Message);
             }
         }
 
-        /* ============================================================ */
-        /*  PUBLIC HELPERS                                              */
-        /* ============================================================ */
         public void Accept() => _escrowDecision?.TrySetResult(true);
         public void Return() => _escrowDecision?.TrySetResult(false);
 
         public bool DispenseChange(int amount)
         {
-            // 1. Pobierz aktualny stan tub (komenda R,0A)
+            // ResetDeviceCoinState();
+            _logger.LogInformation("Dispensing change: {Amount} gr", amount);
             _device.Write("R,0A");
             string response = ReadLineLogged();
-            var tubeMap = ParseTubeStatus(response); // słownik: nominał -> liczba sztuk
+            var tubeMap = ParseTubeStatus(response);
 
-            // 2. Jeśli nie udało się sparsować stanu tub, od razu zwracamy false
             if (tubeMap == null || tubeMap.Count == 0)
             {
-                // Brak danych o stanie tuby – nie wypłacamy
                 EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
                 return false;
             }
 
-            // 3. Przygotuj rozkład na nominały (greedy od największego do najmniejszego)
-            //    _tubeValues = { 10, 20, 50, 100, 200, 500 }
-            //    Posortuj malejąco:
-            int[] sortedValues = _tubeValues.OrderByDescending(v => v).ToArray();
+            int[] sortedValues = tubeMap.Keys.OrderByDescending(v => v).ToArray();
 
-            // Tymczasowa struktura na liczbę monet do wypłacenia: nominał -> ile sztuk
             var toDispense = new Dictionary<int, int>();
             int remaining = amount;
 
             foreach (int coinValue in sortedValues)
             {
-                // Jeżeli kwota do wydania jest już zerowa, przerywamy
                 if (remaining <= 0)
                     break;
 
-                // Sprawdź, ile mamy min. tego nominału w tubie (jeśli nie ma klucza, traktujemy jako zero)
                 tubeMap.TryGetValue(coinValue, out int availableCount);
 
                 if (availableCount <= 0)
@@ -258,14 +250,11 @@ namespace ITBees.Mdb
                 remaining -= use * coinValue;
             }
 
-            // 4. Jeżeli po próbie rozkładu zostało coś do wydania, to znaczy, że brakuje monet
             if (remaining > 0)
             {
-                // Nie ma wystarczająco monet, nie próbujemy wypłacać czegokolwiek
                 return false;
             }
 
-            // 5. Wypłać monety po jednym (metoda DispenseCoin generuje zdarzenia CoinDispensed)
             foreach (var kv in toDispense)
             {
                 int coinValue = kv.Key;
@@ -273,29 +262,27 @@ namespace ITBees.Mdb
 
                 for (int i = 0; i < countToDispense; i++)
                 {
+                    _logger.LogInformation("Dispensing coin {CoinValue} gr", coinValue);
                     bool ok = DispenseCoin(coinValue);
                     if (!ok)
                     {
-                        // Jeżeli nie udało się wypłacić pojedynczej monety (np. problem z komunikacją),
-                        // możemy przerwać dalszą wypłatę i zwrócić false.
+                        _logger.LogError($"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr");
                         EmitError($"Błąd przy wypłacie monety {coinValue} gr");
                         return false;
                     }
-                    // Jeżeli wypłata powiodła się, to w handle’u ProcessSingleCoinFrame
-                    // zostanie wygenerowane DeviceEvent typu CoinDispensed.
                 }
             }
 
             return true;
         }
 
-
         public bool DispenseCoin(int value)
         {
-            int idx = Array.IndexOf(_tubeValues, value);
-            if (idx < 0) return false;
+            if (!_coinValueToType.TryGetValue(value, out var coinType))
+                return false;
 
-            _device.Write($"R,0D,{(0x10 | idx):X2}");
+            byte param = (byte)(0x10 | (coinType & 0x0F));
+            _device.Write($"R,0D,{param:X2}");
             return ReadLineLogged().StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -315,16 +302,13 @@ namespace ITBees.Mdb
             _cashlessBusy = true;
             try
             {
-                // 0. Enable cashless #2 (bit1 = 02) – C,64,02
                 WriteDbg("C,64,02");
                 if (!ReadAck()) return Fail("ENABLE no ACK");
                 await Task.Delay(300, ct);
 
-                // Teraz Reset == 0x60
                 WriteDbg("C,60");
 
-                // Czekamy maksymalnie 5 sek na pierwsze "d,STATUS,RESET"
-                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var sw = Stopwatch.StartNew();
                 const int timeoutMs = 5000;
                 bool seenReset = false;
                 while (sw.ElapsedMilliseconds < timeoutMs)
@@ -332,20 +316,17 @@ namespace ITBees.Mdb
                     await Task.Delay(100, ct);
                     WriteDbg("C,62");
                     string rsp = ReadLineLogged();
-                    // ignorujemy c,ERR i p,NACK, dopóki nie pojawi się RESET
                     if (rsp.StartsWith("d,STATUS,RESET",
                             StringComparison.OrdinalIgnoreCase))
                     {
                         seenReset = true;
                         break;
                     }
-                    // pomińmy inne linie aż do timeoutu
                 }
 
                 if (!seenReset)
                     return Fail("RESET no ACK (timeout waiting for STATUS,RESET)");
 
-                // 2. Setup – C,61
                 WriteDbg("C,61");
                 string setup = ReadNextNonAck(_device);
                 byte decimals = 2;
@@ -355,10 +336,8 @@ namespace ITBees.Mdb
                     if (b.Length >= 7) decimals = b[6];
                 }
 
-                // 3. Display text (opcjonalne)
                 SendDisplayText($"Product {amountCents / 100.0:0.00} PLN");
 
-                // 4. Vend Request – C,63,<hi>,<lo>
                 uint scaled = (uint)(amountCents / Math.Pow(10, decimals));
                 byte hi = (byte)(scaled >> 8), lo = (byte)scaled;
                 WriteDbg($"C,63,{hi:X2},{lo:X2}");
@@ -369,7 +348,6 @@ namespace ITBees.Mdb
                     new DeviceEventArgs(DeviceEventType.CashlessSessionStarted,
                         PaymentType.Card, amountCents));
 
-                // 5. Poll dla zatwierdzenia – C,62
                 var deadline = DateTime.UtcNow.AddSeconds(30);
                 while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
                 {
@@ -411,11 +389,6 @@ namespace ITBees.Mdb
             }
         }
 
-
-        // -------------------------
-        // Poniżej pozostałe potrzebne metody i pomocnicze fragmenty
-        // -------------------------
-
         private void WriteDbg(string cmd)
         {
             Console.WriteLine($"TX » {cmd}");
@@ -425,7 +398,6 @@ namespace ITBees.Mdb
         private string ReadLineLogged()
         {
             string s = _device.Read();
-            //Console.WriteLine($"RX « {s}");
             return s;
         }
 
@@ -492,14 +464,14 @@ namespace ITBees.Mdb
             if (text.Length > 32) text = text.Substring(0, 32);
             byte[] utf8 = Encoding.UTF8.GetBytes(text);
             byte[] frame = new byte[utf8.Length + 3];
-            frame[0] = 0x65; // bajt komendy
-            frame[1] = (byte)(utf8.Length + 1); // długość (bajt typu + tekst)
-            frame[2] = 0x06; // typ = nazwa produktu
+            frame[0] = 0x65;
+            frame[1] = (byte)(utf8.Length + 1);
+            frame[2] = 0x06;
             Buffer.BlockCopy(utf8, 0, frame, 3, utf8.Length);
 
             string cmd = "R," + string.Join(',', frame.Select(b => b.ToString("X2")));
             WriteDbg(cmd);
-            ReadAck(); // ignorujemy, jeśli urządzenie nie wspiera wyświetlania
+            ReadAck();
         }
 
         private void EmitError(string m) =>
@@ -512,7 +484,6 @@ namespace ITBees.Mdb
             return false;
         }
 
-
         private int? TryParseBill(string line)
         {
             if (string.IsNullOrEmpty(line) || line.StartsWith("p,ACK")) return null;
@@ -521,8 +492,8 @@ namespace ITBees.Mdb
             try
             {
                 int v = Convert.ToInt32(hex, 16);
-                int route = (v & 0xF0) >> 4; // 9 = escrow
-                int type = v & 0x0F; // 0-5
+                int route = (v & 0xF0) >> 4;
+                int type = v & 0x0F;
                 if (route == 9 && type < _billValues.Length)
                     return _billValues[type];
             }
@@ -537,15 +508,72 @@ namespace ITBees.Mdb
         private Dictionary<int, int> ParseTubeStatus(string data)
         {
             var map = new Dictionary<int, int>();
-            if (string.IsNullOrEmpty(data) || data.StartsWith("p,ACK")) return map;
-            string hex = data.Replace("p,", string.Empty);
-            byte[] bytes = Enumerable.Range(0, hex.Length / 2)
-                .Select(i => Convert.ToByte(hex.Substring(i * 2, 2), 16))
-                .ToArray();
-            if (bytes.Length < 18) return map; // 2 bajty FULL + 16 liczników
-            for (int i = 0; i < _tubeValues.Length && i < 16; i++)
-                map[_tubeValues[i]] = bytes[2 + i];
+            if (string.IsNullOrEmpty(data)) return map;
+
+            string hex = data.StartsWith("p,") ? data.Substring(2) : data;
+            hex = new string(hex.Where(IsHex).ToArray());
+            byte[] bytes = AsHexBytes(hex);
+
+            if (bytes.Length < 3)
+                return map;
+
+            int countBytes = Math.Min(16, bytes.Length - 2);
+
+            for (int coinType = 0; coinType < countBytes; coinType++)
+            {
+                byte count = bytes[2 + coinType];
+                if (count == 0) continue;
+
+                if (_coinTypeToValue.TryGetValue(coinType, out var valueInCents))
+                {
+                    map[valueInCents] = count;
+                }
+            }
+
             return map;
+        }
+
+        private void LoadCoinConfiguration(string line)
+        {
+            try
+            {
+                string hex = line.StartsWith("p,") ? line.Substring(2) : line;
+                hex = new string(hex.Where(IsHex).ToArray());
+                var bytes = AsHexBytes(hex);
+
+                if (bytes.Length < 8)
+                {
+                    _logger.LogWarning("COIN TYPE response too short: {Len}", bytes.Length);
+                    return;
+                }
+
+                _coinTypeToValue.Clear();
+                _coinValueToType.Clear();
+
+                _coinScalingFactor = bytes[3] == 0 ? 1 : bytes[3];
+                _coinDecimalPlaces = bytes[4];
+
+                for (int coinType = 0; coinType < 16 && (7 + coinType) < bytes.Length; coinType++)
+                {
+                    byte credit = bytes[7 + coinType];
+                    if (credit == 0 || credit == 0xFF)
+                        continue;
+
+                    int valueInCents = credit * _coinScalingFactor;
+
+                    _coinTypeToValue[coinType] = valueInCents;
+                    if (!_coinValueToType.ContainsKey(valueInCents))
+                        _coinValueToType[valueInCents] = coinType;
+                }
+
+                _logger.LogInformation(
+                    "Loaded COIN TYPE config. Scaling={Scaling}, Decimals={Decimals}, Types={Types}",
+                    _coinScalingFactor, _coinDecimalPlaces, _coinTypeToValue.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load COIN TYPE configuration");
+            }
         }
 
         internal enum CoinRoute : byte
