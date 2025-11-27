@@ -106,6 +106,12 @@ namespace ITBees.Mdb
             }
             catch (TimeoutException)
             {
+                _logger.LogError("SerialPort read timeout");
+                return string.Empty;
+            }
+            catch (Exception e)
+            {
+                _logger.LogError("SerialPort read error: " + e.Message);
                 return string.Empty;
             }
         }
