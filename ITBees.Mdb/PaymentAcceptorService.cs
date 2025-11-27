@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
+using ITBees.Interfaces.Logs;
 using Microsoft.Extensions.Logging;
 
 namespace ITBees.Mdb
@@ -9,6 +10,7 @@ namespace ITBees.Mdb
     {
         private readonly ISerialDevice _device;
         private readonly ILogger<PaymentAcceptorService> _logger;
+        private readonly ILiveLogListener _liveLogger;
 
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
 
@@ -24,10 +26,11 @@ namespace ITBees.Mdb
 
         public event EventHandler<DeviceEventArgs>? DeviceEvent;
 
-        public PaymentAcceptorService(ISerialDevice device, ILogger<PaymentAcceptorService> logger)
+        public PaymentAcceptorService(ISerialDevice device, ILogger<PaymentAcceptorService> logger,  ILiveLogListener liveLogger)
         {
             _device = device;
             _logger = logger;
+            _liveLogger = liveLogger;
         }
 
         public void Start(string port)
@@ -41,12 +44,14 @@ namespace ITBees.Mdb
             _cts?.Cancel();
             try
             {
+                _liveLogger.LogMessage("Shutting down MDB device...").Wait();
                 _device.Write("M,0");
                 ReadLineLogged();
                 _device.Close();
             }
             catch
             {
+                _liveLogger.LogMessage("Shutting down MDB device error").Wait();
             }
         }
 
@@ -59,6 +64,7 @@ namespace ITBees.Mdb
 
         private void InitDevices()
         {
+            _liveLogger.LogMessage("Init MDB Device started...").Wait();
             _device.Write("M,1");
             ReadLineLogged();
 
@@ -101,6 +107,7 @@ namespace ITBees.Mdb
                 catch (Exception ex)
                 {
                     EmitError(ex.Message);
+                    _liveLogger.LogErrorMessage("Error on PollLoop, message " + ex.Message).Wait();
                 }
 
                 await Task.Delay(200, _cts.Token);
@@ -117,6 +124,7 @@ namespace ITBees.Mdb
 
         private async Task HandleBillAsync(int amt, CancellationToken token)
         {
+            await _liveLogger.LogErrorMessage("Handle bill, amount :" + amt);
             _escrowDecision = new TaskCompletionSource<bool>();
             DeviceEvent?.Invoke(this,
                 new DeviceEventArgs(DeviceEventType.CashEscrowRequested,
@@ -127,10 +135,14 @@ namespace ITBees.Mdb
 
             bool accept = finished == _escrowDecision.Task && _escrowDecision.Task.Result;
             if (finished != _escrowDecision.Task)
+            {
                 EmitError("Escrow timeout – returning note");
+                await _liveLogger.LogErrorMessage("Escrow timeout – returning note");
+            }
 
             _device.Write($"R,35,{(accept ? 1 : 0)}");
             ReadLineLogged();
+            await _liveLogger.LogMessage($"Bill {amt}" + (accept ? "accepted" : "returned"));
             DeviceEvent?.Invoke(this,
                 new DeviceEventArgs(DeviceEventType.CashProcessed,
                     PaymentType.Cash, amt, accept));
@@ -162,9 +174,11 @@ namespace ITBees.Mdb
             int routing = (b1 >> 4) & 0b11;
             int coinType = b1 & 0b1111;
 
-            _logger.LogDebug("[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} routing={Routing} coinType={CoinType}",
+            _logger.LogDebug(
+                "[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} routing={Routing} coinType={CoinType}",
                 frame, b1, b2, routing, coinType);
 
+            // 3 = rejected / invalid
             if (routing == 0b11)
             {
                 _logger.LogInformation("[MDB COIN] coin rejected, type={CoinType}, frame={Frame}", coinType, frame);
@@ -177,16 +191,26 @@ namespace ITBees.Mdb
                 return;
             }
 
+            // Interpretacja:
+            //  routing == 0b00 -> moneta poszła do cashboxa
+            //  routing == 0b01 lub 0b10 -> moneta trafiła do tub (do wydawania reszty)
+            var target = routing == 0b00
+                ? DeviceEventType.CoinToCashbox
+                : DeviceEventType.CoinReceived; // "received & available" w tubach
+
+            _logger.LogInformation(
+                "[MDB COIN] coin received: value={Value} gr, routing={Routing}, type={CoinType}",
+                amountInCents, routing, coinType);
+
             var evt = new DeviceEventArgs(
                 DeviceEventType.CoinReceived,
                 PaymentType.Coin,
                 amountInCents,
-                targetCashHolder: routing == 0b00
-                    ? DeviceEventType.CoinToCashbox
-                    : DeviceEventType.CoinReceived);
+                targetCashHolder: target);
 
             DeviceEvent?.Invoke(this, evt);
         }
+        
         public void ResetDeviceCoinState()
         {
             try
@@ -213,8 +237,7 @@ namespace ITBees.Mdb
 
         public bool DispenseChange(int amount)
         {
-            // ResetDeviceCoinState();
-            _logger.LogInformation("Dispensing change: {Amount} gr", amount);
+            _liveLogger.LogMessage("Dispensing change: " + amount + " gr").Wait();
             _device.Write("R,0A");
             string response = ReadLineLogged();
             var tubeMap = ParseTubeStatus(response);
@@ -222,6 +245,7 @@ namespace ITBees.Mdb
             if (tubeMap == null || tubeMap.Count == 0)
             {
                 EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
+                _liveLogger.LogErrorMessage("Failed to get tube status when dispensing change").Wait();
                 return false;
             }
 
@@ -262,11 +286,11 @@ namespace ITBees.Mdb
 
                 for (int i = 0; i < countToDispense; i++)
                 {
-                    _logger.LogInformation("Dispensing coin {CoinValue} gr", coinValue);
+                    _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
                     bool ok = DispenseCoin(coinValue);
                     if (!ok)
                     {
-                        _logger.LogError($"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr");
+                        _liveLogger.LogErrorMessage($"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr");
                         EmitError($"Błąd przy wypłacie monety {coinValue} gr");
                         return false;
                     }
@@ -283,16 +307,29 @@ namespace ITBees.Mdb
 
             byte param = (byte)(0x10 | (coinType & 0x0F));
             _device.Write($"R,0D,{param:X2}");
-            return ReadLineLogged().StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
+            var line = ReadLineLogged();
+            bool success = line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
+
+            if (success)
+            {
+                // Notify upper layers that a coin of this value was actually dispensed as change
+                DeviceEvent?.Invoke(this,
+                    new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
+            }
+
+            return success;
         }
 
         public void ShowTubeStatus()
         {
+            _liveLogger.LogMessage("Requesting tube status...").Wait();
             _device.Write("R,0A");
             var map = ParseTubeStatus(ReadLineLogged());
-            Console.WriteLine("Tube status:");
+            _liveLogger.LogMessage("Tube status:").Wait();
             foreach (var kv in map)
-                Console.WriteLine($"  {kv.Key} gr: {kv.Value}");
+            {
+                _liveLogger.LogMessage($"  {kv.Key} gr: {kv.Value}").Wait();
+            }
         }
 
         public async Task<bool> StartSigmaPaymentAsync(int amountCents,
@@ -544,6 +581,7 @@ namespace ITBees.Mdb
                 if (bytes.Length < 8)
                 {
                     _logger.LogWarning("COIN TYPE response too short: {Len}", bytes.Length);
+                    _liveLogger.LogErrorMessage("COIN TYPE response too short").Wait();
                     return;
                 }
 
@@ -566,9 +604,7 @@ namespace ITBees.Mdb
                         _coinValueToType[valueInCents] = coinType;
                 }
 
-                _logger.LogInformation(
-                    "Loaded COIN TYPE config. Scaling={Scaling}, Decimals={Decimals}, Types={Types}",
-                    _coinScalingFactor, _coinDecimalPlaces, _coinTypeToValue.Count);
+                _liveLogger.LogMessage($"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={ _coinTypeToValue.Count}").Wait();
             }
             catch (Exception ex)
             {
