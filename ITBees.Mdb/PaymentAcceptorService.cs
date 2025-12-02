@@ -256,6 +256,7 @@ namespace ITBees.Mdb
 
             foreach (int coinValue in sortedValues)
             {
+                _liveLogger.LogMessage("Considering coin value: " + coinValue + " gr").Wait();
                 if (remaining <= 0)
                     break;
 
