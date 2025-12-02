@@ -6,5 +6,5 @@ public interface ICashInventoryService
     Task RegisterCoinAcceptedAsync(int nominalInGrosze);       // e.g. 200 = 2 PLN
     Task RegisterCoinDispensedAsync(int nominalInGrosze);      // coin used as change
 
-    CashInventoryState GetSnapshot();
+    CashInventoryStateVm GetSnapshot();
 }

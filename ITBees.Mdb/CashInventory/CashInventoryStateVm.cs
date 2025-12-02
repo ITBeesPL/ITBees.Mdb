@@ -1,6 +1,6 @@
 ﻿namespace ITBees.Mdb.CashInventory;
 
-public class CashInventoryState
+public class CashInventoryStateVm
 {
     // Key = nominal in grosze, Value = quantity
     public Dictionary<int, int> Banknotes { get; set; } = new Dictionary<int, int>();

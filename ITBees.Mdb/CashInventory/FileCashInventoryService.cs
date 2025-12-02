@@ -12,13 +12,13 @@ public sealed class FileCashInventoryService : ICashInventoryService
     private readonly ILogger<FileCashInventoryService> _logger;
     private readonly string _filePath;
     private readonly object _lock = new object();
-    private CashInventoryState _state;
+    private CashInventoryStateVm _stateVm;
 
     public FileCashInventoryService(ILogger<FileCashInventoryService> logger)
     {
         _logger = logger;
         _filePath = ResolveFilePath();
-        _state = LoadFromFile();
+        _stateVm = LoadFromFile();
     }
 
     public async Task RegisterBanknoteAcceptedAsync(int nominalInGrosze)
@@ -27,11 +27,11 @@ public sealed class FileCashInventoryService : ICashInventoryService
 
         lock (_lock)
         {
-            if (!_state.Banknotes.ContainsKey(nominalInGrosze))
-                _state.Banknotes[nominalInGrosze] = 0;
+            if (!_stateVm.Banknotes.ContainsKey(nominalInGrosze))
+                _stateVm.Banknotes[nominalInGrosze] = 0;
 
-            _state.Banknotes[nominalInGrosze]++;
-            _state.LastUpdatedUtc = DateTime.UtcNow;
+            _stateVm.Banknotes[nominalInGrosze]++;
+            _stateVm.LastUpdatedUtc = DateTime.UtcNow;
             SaveToFileLocked();
         }
 
@@ -44,11 +44,11 @@ public sealed class FileCashInventoryService : ICashInventoryService
 
         lock (_lock)
         {
-            if (!_state.Coins.ContainsKey(nominalInGrosze))
-                _state.Coins[nominalInGrosze] = 0;
+            if (!_stateVm.Coins.ContainsKey(nominalInGrosze))
+                _stateVm.Coins[nominalInGrosze] = 0;
 
-            _state.Coins[nominalInGrosze]++;
-            _state.LastUpdatedUtc = DateTime.UtcNow;
+            _stateVm.Coins[nominalInGrosze]++;
+            _stateVm.LastUpdatedUtc = DateTime.UtcNow;
             SaveToFileLocked();
         }
 
@@ -61,28 +61,28 @@ public sealed class FileCashInventoryService : ICashInventoryService
 
         lock (_lock)
         {
-            if (_state.Coins.TryGetValue(nominalInGrosze, out var qty) && qty > 0)
+            if (_stateVm.Coins.TryGetValue(nominalInGrosze, out var qty) && qty > 0)
             {
-                _state.Coins[nominalInGrosze] = qty - 1;
+                _stateVm.Coins[nominalInGrosze] = qty - 1;
             }
             // If there is no coin recorded for that nominal, we do nothing.
-            _state.LastUpdatedUtc = DateTime.UtcNow;
+            _stateVm.LastUpdatedUtc = DateTime.UtcNow;
             SaveToFileLocked();
         }
 
         await Task.CompletedTask;
     }
 
-    public CashInventoryState GetSnapshot()
+    public CashInventoryStateVm GetSnapshot()
     {
         lock (_lock)
         {
             // Return a shallow copy to avoid external modifications of internal state
-            return new CashInventoryState
+            return new CashInventoryStateVm
             {
-                Banknotes = new Dictionary<int, int>(_state.Banknotes),
-                Coins = new Dictionary<int, int>(_state.Coins),
-                LastUpdatedUtc = _state.LastUpdatedUtc
+                Banknotes = new Dictionary<int, int>(_stateVm.Banknotes),
+                Coins = new Dictionary<int, int>(_stateVm.Coins),
+                LastUpdatedUtc = _stateVm.LastUpdatedUtc
             };
         }
     }
@@ -102,22 +102,22 @@ public sealed class FileCashInventoryService : ICashInventoryService
         return Path.Combine(targetDir, "cash_inventory.json");
     }
 
-    private CashInventoryState LoadFromFile()
+    private CashInventoryStateVm LoadFromFile()
     {
         try
         {
             if (!File.Exists(_filePath))
-                return new CashInventoryState { LastUpdatedUtc = DateTime.UtcNow };
+                return new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
 
             var json = File.ReadAllText(_filePath);
-            var state = JsonSerializer.Deserialize<CashInventoryState>(json);
-            return state ?? new CashInventoryState { LastUpdatedUtc = DateTime.UtcNow };
+            var state = JsonSerializer.Deserialize<CashInventoryStateVm>(json);
+            return state ?? new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
         }
         catch
         {
             // In case of any error (corrupted file, etc.), start from clean state
             _logger.LogError("Failed to load cash inventory from file '{FilePath}'. Starting from empty state.", _filePath);
-            return new CashInventoryState { LastUpdatedUtc = DateTime.UtcNow };
+            return new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
         }
     }
 
@@ -134,7 +134,7 @@ public sealed class FileCashInventoryService : ICashInventoryService
                 WriteIndented = true
             };
 
-            var json = JsonSerializer.Serialize(_state, options);
+            var json = JsonSerializer.Serialize(_stateVm, options);
             var tempPath = _filePath + ".tmp";
 
             File.WriteAllText(tempPath, json);
