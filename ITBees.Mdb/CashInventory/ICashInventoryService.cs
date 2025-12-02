@@ -7,4 +7,6 @@ public interface ICashInventoryService
     Task RegisterCoinDispensedAsync(int nominalInGrosze);      // coin used as change
 
     CashInventoryStateVm GetSnapshot();
+    Task ResetBanknotesAsync();
+    Task ResetCoinsAsync();
 }

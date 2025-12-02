@@ -3,7 +3,19 @@
 public class CashInventoryStateVm
 {
     // Key = nominal in grosze, Value = quantity
-    public Dictionary<int, int> Banknotes { get; set; } = new Dictionary<int, int>();
-    public Dictionary<int, int> Coins { get; set; } = new Dictionary<int, int>();
+    public List<Banknote> Banknotes { get; set; } = new();
+    public List<Coin> Coins { get; set; } = new();
     public DateTime LastUpdatedUtc { get; set; }
+}
+
+public class Banknote
+{
+    public int NominalInGrosze { get; set; }
+    public int Quantity { get; set; }
+}
+
+public class Coin
+{
+    public int NominalInGrosze { get; set; }
+    public int Quantity { get; set; }
 }
