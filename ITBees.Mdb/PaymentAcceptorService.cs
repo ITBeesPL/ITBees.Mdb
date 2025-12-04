@@ -11,6 +11,7 @@ namespace ITBees.Mdb
         private readonly ISerialDevice _device;
         private readonly ILogger<PaymentAcceptorService> _logger;
         private readonly ILiveLogListener _liveLogger;
+        private readonly object _ioLock = new(); 
 
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
 
@@ -97,11 +98,14 @@ namespace ITBees.Mdb
                 {
                     if (!_cashlessBusy)
                     {
-                        _device.Write("R,33");
-                        HandleBills(ReadLineLogged());
+                        lock (_ioLock)
+                        {
+                            _device.Write("R,33");
+                            HandleBills(ReadLineLogged("PollBills"));
 
-                        _device.Write("R,0B");
-                        HandleCoins(ReadLineLogged());
+                            _device.Write("R,0B");
+                            HandleCoins(ReadLineLogged("PollCoins"));
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -236,90 +240,119 @@ namespace ITBees.Mdb
         public void Return() => _escrowDecision?.TrySetResult(false);
 
         public bool DispenseChange(int amount)
+{
+    _liveLogger.LogMessage("Dispensing change: " + amount + " gr").Wait();
+
+    Dictionary<int, int> tubeMap;
+    lock (_ioLock)
+    {
+        _device.Write("R,0A");
+        string response = ReadLineLogged("TubeStatus");
+        tubeMap = ParseTubeStatus(response);
+    }
+
+    if (tubeMap == null || tubeMap.Count == 0)
+    {
+        EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
+        _liveLogger.LogErrorMessage("Failed to get tube status when dispensing change").Wait();
+        return false;
+    }
+
+    int[] sortedValues = tubeMap.Keys.OrderByDescending(v => v).ToArray();
+
+    var toDispense = new Dictionary<int, int>();
+    int remaining = amount;
+
+    foreach (int coinValue in sortedValues)
+    {
+        _liveLogger.LogMessage("Considering coin value: " + coinValue + " gr").Wait();
+        if (remaining <= 0)
+            break;
+
+        tubeMap.TryGetValue(coinValue, out int availableCount);
+
+        if (availableCount <= 0)
         {
-            _liveLogger.LogMessage("Dispensing change: " + amount + " gr").Wait();
-            _device.Write("R,0A");
-            string response = ReadLineLogged();
-            var tubeMap = ParseTubeStatus(response);
-
-            if (tubeMap == null || tubeMap.Count == 0)
-            {
-                EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
-                _liveLogger.LogErrorMessage("Failed to get tube status when dispensing change").Wait();
-                return false;
-            }
-
-            int[] sortedValues = tubeMap.Keys.OrderByDescending(v => v).ToArray();
-
-            var toDispense = new Dictionary<int, int>();
-            int remaining = amount;
-
-            foreach (int coinValue in sortedValues)
-            {
-                _liveLogger.LogMessage("Considering coin value: " + coinValue + " gr").Wait();
-                if (remaining <= 0)
-                    break;
-
-                tubeMap.TryGetValue(coinValue, out int availableCount);
-
-                if (availableCount <= 0)
-                {
-                    toDispense[coinValue] = 0;
-                    continue;
-                }
-
-                int needed = remaining / coinValue;
-                int use = Math.Min(needed, availableCount);
-
-                toDispense[coinValue] = use;
-                remaining -= use * coinValue;
-            }
-
-            if (remaining > 0)
-            {
-                return false;
-            }
-
-            foreach (var kv in toDispense)
-            {
-                int coinValue = kv.Key;
-                int countToDispense = kv.Value;
-
-                for (int i = 0; i < countToDispense; i++)
-                {
-                    _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
-                    bool ok = DispenseCoin(coinValue);
-                    Thread.Sleep(500);
-                    if (!ok)
-                    {
-                        _liveLogger.LogErrorMessage($"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr");
-                        EmitError($"Błąd przy wypłacie monety {coinValue} gr");
-                        return false;
-                    }
-                }
-            }
-
-            return true;
+            toDispense[coinValue] = 0;
+            continue;
         }
 
+        int needed = remaining / coinValue;
+        int use = Math.Min(needed, availableCount);
+
+        toDispense[coinValue] = use;
+        remaining -= use * coinValue;
+    }
+
+    if (remaining > 0)
+    {
+        _liveLogger.LogErrorMessage(
+            $"Cannot make exact change: remaining={remaining} gr, requested={amount} gr").Wait();
+        return false;
+    }
+
+    foreach (var kv in toDispense)
+    {
+        int coinValue = kv.Key;
+        int countToDispense = kv.Value;
+
+        for (int i = 0; i < countToDispense; i++)
+        {
+            _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
+
+            bool ok = DispenseCoin(coinValue); 
+
+            Thread.Sleep(500); 
+
+            if (!ok)
+            {
+                _liveLogger.LogErrorMessage(
+                    $"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr").Wait();
+                EmitError($"Błąd przy wypłacie monety {coinValue} gr");
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+        
         public bool DispenseCoin(int value)
         {
             if (!_coinValueToType.TryGetValue(value, out var coinType))
-                return false;
-
-            byte param = (byte)(0x10 | (coinType & 0x0F));
-            _device.Write($"R,0D,{param:X2}");
-            var line = ReadLineLogged();
-            bool success = line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
-
-            if (success)
             {
-                // Notify upper layers that a coin of this value was actually dispensed as change
-                DeviceEvent?.Invoke(this,
-                    new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
+                _logger.LogWarning("DispenseCoin: unknown coin value {Value} gr", value);
+                return false;
             }
 
-            return success;
+            byte param = (byte)(0x10 | (coinType & 0x0F));
+
+            string line;
+            lock (_ioLock)
+            {
+                _liveLogger.LogMessage(
+                    $"Sending payout for {value} gr (coinType={coinType}, param=0x{param:X2})").Wait();
+
+                _device.Write($"R,0D,{param:X2}");
+                line = ReadLineLogged("DispenseCoin");
+            }
+
+            bool success = line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
+
+            if (!success)
+            {
+                _liveLogger.LogErrorMessage(
+                    $"DispenseCoin failed for {value} gr (coinType={coinType}), device response: {line}").Wait();
+                _logger.LogWarning(
+                    "DispenseCoin failed for value={Value} gr, type={CoinType}, deviceResponse={Response}",
+                    value, coinType, line);
+                return false;
+            }
+
+            DeviceEvent?.Invoke(this,
+                new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
+
+            return true;
         }
 
         public void ShowTubeStatus()
@@ -434,9 +467,14 @@ namespace ITBees.Mdb
             _device.Write(cmd);
         }
 
-        private string ReadLineLogged()
+        private string ReadLineLogged(string context = null)
         {
             string s = _device.Read();
+            if (!string.IsNullOrEmpty(context))
+                _logger.LogInformation("[MDB RX:{Context}] {Line}", context, s);
+            else
+                _logger.LogInformation("[MDB RX] {Line}", s);
+
             return s;
         }
 
