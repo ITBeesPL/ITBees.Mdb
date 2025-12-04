@@ -289,6 +289,7 @@ namespace ITBees.Mdb
                 {
                     _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
                     bool ok = DispenseCoin(coinValue);
+                    Thread.Sleep(500);
                     if (!ok)
                     {
                         _liveLogger.LogErrorMessage($"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr");
