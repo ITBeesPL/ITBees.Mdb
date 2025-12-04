@@ -24,6 +24,7 @@ namespace ITBees.Mdb
         private CancellationTokenSource _cts;
         private TaskCompletionSource<bool> _escrowDecision;
         private volatile bool _cashlessBusy;
+        private bool _deviceRunnig;
 
         public event EventHandler<DeviceEventArgs>? DeviceEvent;
 
@@ -38,6 +39,7 @@ namespace ITBees.Mdb
         {
             Prepare(port);
             _ = PollLoop();
+            _deviceRunnig = true;
         }
 
         public void Stop()
@@ -49,6 +51,7 @@ namespace ITBees.Mdb
                 _device.Write("M,0");
                 ReadLineLogged();
                 _device.Close();
+                _deviceRunnig = false;
             }
             catch
             {
@@ -316,7 +319,12 @@ namespace ITBees.Mdb
 
     return true;
 }
-        
+
+        public bool DeviceRunning()
+        {
+            return _deviceRunnig;
+        }
+
         public bool DispenseCoin(int value)
         {
             if (!_coinValueToType.TryGetValue(value, out var coinType))

@@ -8,4 +8,5 @@ public interface IPaymentAcceptorService
     void Accept();
     void Return();
     bool DispenseChange(int amount);
+    bool DeviceRunning();
 }
