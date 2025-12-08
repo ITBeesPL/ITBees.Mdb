@@ -5,6 +5,7 @@ public class CashInventoryStateVm
     // Key = nominal in grosze, Value = quantity
     public List<Banknote> Banknotes { get; set; } = new();
     public List<Coin> Coins { get; set; } = new();
+    public List<Coin> CoinsInCashbox { get; set; } = new();
     public DateTime LastUpdatedUtc { get; set; }
 }
 

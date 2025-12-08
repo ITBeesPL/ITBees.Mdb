@@ -9,4 +9,6 @@ public interface ICashInventoryService
     CashInventoryStateVm GetSnapshot();
     Task ResetBanknotesAsync();
     Task ResetCoinsAsync();
+    Task RegisterCoinToCashboxAcceptedAsync(int nominalInGrosze);
+    Task ResetCoinsInCashboxAsync();
 }

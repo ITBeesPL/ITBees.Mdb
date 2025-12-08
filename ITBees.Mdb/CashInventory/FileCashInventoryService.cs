@@ -44,6 +44,9 @@ public sealed class FileCashInventoryService : ICashInventoryService
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Coin routed to tubes (available for change).
+    /// </summary>
     public Task RegisterCoinAcceptedAsync(int nominalInGrosze)
     {
         if (nominalInGrosze <= 0) return Task.CompletedTask;
@@ -71,6 +74,36 @@ public sealed class FileCashInventoryService : ICashInventoryService
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Coin routed directly to cashbox.
+    /// </summary>
+    public Task RegisterCoinToCashboxAcceptedAsync(int nominalInGrosze)
+    {
+        if (nominalInGrosze <= 0) return Task.CompletedTask;
+
+        lock (_lock)
+        {
+            var entry = _stateVm.CoinsInCashbox.FirstOrDefault(x => x.NominalInGrosze == nominalInGrosze);
+            if (entry == null)
+            {
+                _stateVm.CoinsInCashbox.Add(new Coin
+                {
+                    NominalInGrosze = nominalInGrosze,
+                    Quantity = 1
+                });
+            }
+            else
+            {
+                entry.Quantity++;
+            }
+
+            _stateVm.LastUpdatedUtc = DateTime.UtcNow;
+            SaveToFileLocked();
+        }
+
+        return Task.CompletedTask;
+    }
+
     public Task RegisterCoinDispensedAsync(int nominalInGrosze)
     {
         if (nominalInGrosze <= 0) return Task.CompletedTask;
@@ -81,6 +114,10 @@ public sealed class FileCashInventoryService : ICashInventoryService
             if (entry != null && entry.Quantity > 0)
             {
                 entry.Quantity--;
+                if (entry.Quantity <= 0)
+                {
+                    _stateVm.Coins.Remove(entry);
+                }
             }
 
             _stateVm.LastUpdatedUtc = DateTime.UtcNow;
@@ -112,6 +149,14 @@ public sealed class FileCashInventoryService : ICashInventoryService
                     })
                     .ToList(),
 
+                CoinsInCashbox = _stateVm.CoinsInCashbox
+                    .Select(x => new Coin
+                    {
+                        NominalInGrosze = x.NominalInGrosze,
+                        Quantity = x.Quantity
+                    })
+                    .ToList(),
+
                 LastUpdatedUtc = _stateVm.LastUpdatedUtc
             };
         }
@@ -134,19 +179,35 @@ public sealed class FileCashInventoryService : ICashInventoryService
     {
         try
         {
+            var state = new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
             if (!File.Exists(_filePath))
-                return new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
+            {
+                NormalizeState(state);
+                return state;
+            }
 
             var json = File.ReadAllText(_filePath);
-            var state = JsonSerializer.Deserialize<CashInventoryStateVm>(json);
+            state = JsonSerializer.Deserialize<CashInventoryStateVm>(json)
+                        ?? new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
 
-            return state ?? new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
+            NormalizeState(state);
+            return state;
         }
         catch
         {
-            _logger.LogError("Failed to load cash inventory from file '{FilePath}'. Starting from empty state.", _filePath);
-            return new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
+            _logger.LogError("Failed to load cash inventory from file '{FilePath}'. Starting from empty state.",
+                _filePath);
+            var state = new CashInventoryStateVm { LastUpdatedUtc = DateTime.UtcNow };
+            NormalizeState(state);
+            return state;
         }
+    }
+
+    private static void NormalizeState(CashInventoryStateVm state)
+    {
+        state.Banknotes ??= new List<Banknote>();
+        state.Coins ??= new List<Coin>();
+        state.CoinsInCashbox ??= new List<Coin>();
     }
 
     private void SaveToFileLocked()
@@ -172,7 +233,7 @@ public sealed class FileCashInventoryService : ICashInventoryService
             _logger.LogError("Failed to save cash inventory to file '{FilePath}'.", _filePath);
         }
     }
-    
+
     public Task ResetBanknotesAsync()
     {
         lock (_lock)
@@ -190,6 +251,18 @@ public sealed class FileCashInventoryService : ICashInventoryService
         lock (_lock)
         {
             _stateVm.Coins.Clear();
+            _stateVm.LastUpdatedUtc = DateTime.UtcNow;
+            SaveToFileLocked();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task ResetCoinsInCashboxAsync()
+    {
+        lock (_lock)
+        {
+            _stateVm.CoinsInCashbox.Clear();
             _stateVm.LastUpdatedUtc = DateTime.UtcNow;
             SaveToFileLocked();
         }
