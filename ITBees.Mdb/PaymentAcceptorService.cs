@@ -192,15 +192,16 @@ namespace ITBees.Mdb
             byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
             byte b2 = Convert.ToByte(frame.Substring(2, 2), 16);
 
-            int routing = (b1 >> 4) & 0b11;
+            int routeBits = (b1 >> 4) & 0b11;
             int coinType = b1 & 0b1111;
+            var route = (CoinRoute)routeBits;
 
             _logger.LogDebug(
-                "[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} routing={Routing} coinType={CoinType}",
-                frame, b1, b2, routing, coinType);
+                "[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} routeBits={RouteBits} route={Route} coinType={CoinType}",
+                frame, b1, b2, routeBits, route, coinType);
 
             // 3 = rejected / invalid
-            if (routing == 0b11)
+            if (routeBits == 0b11)
             {
                 _logger.LogInformation("[MDB COIN] coin rejected, type={CoinType}, frame={Frame}", coinType, frame);
                 return;
@@ -212,34 +213,77 @@ namespace ITBees.Mdb
                 return;
             }
 
-            // routing == 0b00 -> cashbox
-            // routing == 0b01 or 0b10 -> tubes (change)
-            var target = routing == 0b00
-                ? DeviceEventType.CoinToCashbox
-                : DeviceEventType.CoinReceived;
-
-            _logger.LogInformation(
-                "[MDB COIN] coin received: value={Value} gr, routing={Routing}, type={CoinType}, target={Target}",
-                amountInCents, routing, coinType, target);
-
-            // Update inventory
-            switch (target)
+            // Interpretacja na podstawie CoinRoute:
+            //  ToTube    (0) -> moneta przyjęta do tub
+            //  Dispensed (1) -> moneta wydana z tub (przyciski, reszta)
+            //  ToCashbox (2) -> moneta wrzucona do cashboxa
+            switch (route)
             {
-                case DeviceEventType.CoinReceived:
+                case CoinRoute.ToTube:
+                {
+                    _logger.LogInformation(
+                        "[MDB COIN] coin to tube: value={Value} gr, type={CoinType}",
+                        amountInCents, coinType);
+
+                    // Stan gotówki w tubach + gotówka klienta
                     _ = _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents);
+
+                    var evt = new DeviceEventArgs(
+                        DeviceEventType.CoinReceived,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinReceived);
+
+                    DeviceEvent?.Invoke(this, evt);
                     break;
-                case DeviceEventType.CoinToCashbox:
+                }
+
+                case CoinRoute.Dispensed:
+                {
+                    _logger.LogInformation(
+                        "[MDB COIN] coin dispensed from tube: value={Value} gr, type={CoinType}",
+                        amountInCents, coinType);
+
+                    // Moneta ubyła z tub (przycisk A/B/C lub wydanie reszty)
+                    _ = _cashInventoryService.RegisterCoinDispensedAsync(amountInCents);
+
+                    var evt = new DeviceEventArgs(
+                        DeviceEventType.CoinDispensed,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinDispensed);
+
+                    DeviceEvent?.Invoke(this, evt);
+                    break;
+                }
+
+                case CoinRoute.ToCashbox:
+                {
+                    _logger.LogInformation(
+                        "[MDB COIN] coin to cashbox: value={Value} gr, type={CoinType}",
+                        amountInCents, coinType);
+
+                    // Moneta w cashboxie (nie do wydawania reszty)
                     _ = _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents);
+
+                    var evt = new DeviceEventArgs(
+                        DeviceEventType.CoinToCashbox,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinToCashbox);
+
+                    DeviceEvent?.Invoke(this, evt);
                     break;
+                }
+
+                default:
+                {
+                    _logger.LogInformation(
+                        "[MDB COIN] unhandled route={RouteBits} for coinType={CoinType}, frame={Frame}",
+                        routeBits, coinType, frame);
+                    break;
+                }
             }
-
-            var evt = new DeviceEventArgs(
-                target,
-                PaymentType.Coin,
-                amountInCents,
-                targetCashHolder: target);
-
-            DeviceEvent?.Invoke(this, evt);
         }
 
         public void ResetDeviceCoinState()
