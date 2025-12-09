@@ -27,6 +27,7 @@ namespace ITBees.Mdb
         private TaskCompletionSource<bool> _escrowDecision;
         private volatile bool _cashlessBusy;
         private bool _deviceRunnig;
+        private bool _debugVerboseLogging;
 
         public event EventHandler<DeviceEventArgs>? DeviceEvent;
 
@@ -333,7 +334,8 @@ namespace ITBees.Mdb
                     if (!ok)
                     {
                         _liveLogger.LogErrorMessage(
-                            $"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr").Wait();
+                                $"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr")
+                            .Wait();
                         EmitError($"Błąd przy wypłacie monety {coinValue} gr");
                         return false;
                     }
@@ -346,6 +348,11 @@ namespace ITBees.Mdb
         public bool DeviceRunning()
         {
             return _deviceRunnig;
+        }
+
+        public void EnableVerboseDebugLogging(bool enable)
+        {
+            _debugVerboseLogging = enable;
         }
 
         public bool DispenseCoin(int value)
@@ -503,10 +510,13 @@ namespace ITBees.Mdb
         private string ReadLineLogged(string context = null)
         {
             string s = _device.Read();
-            if (!string.IsNullOrEmpty(context))
-                _logger.LogInformation("[MDB RX:{Context}] {Line}", context, s);
-            else
-                _logger.LogInformation("[MDB RX] {Line}", s);
+            if (_debugVerboseLogging)
+            {
+                if (!string.IsNullOrEmpty(context))
+                    _logger.LogInformation("[MDB RX:{Context}] {Line}", context, s);
+                else
+                    _logger.LogInformation("[MDB RX] {Line}", s);
+            }
 
             return s;
         }
@@ -677,7 +687,9 @@ namespace ITBees.Mdb
                         _coinValueToType[valueInCents] = coinType;
                 }
 
-                _liveLogger.LogMessage($"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}").Wait();
+                _liveLogger.LogMessage(
+                        $"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}")
+                    .Wait();
             }
             catch (Exception ex)
             {

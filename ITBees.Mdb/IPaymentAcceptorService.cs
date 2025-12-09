@@ -9,4 +9,5 @@ public interface IPaymentAcceptorService
     void Return();
     bool DispenseChange(int amount);
     bool DeviceRunning();
+    void EnableVerboseDebugLogging(bool enable);
 }
