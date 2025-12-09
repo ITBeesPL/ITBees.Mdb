@@ -192,31 +192,26 @@ namespace ITBees.Mdb
             byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
             byte b2 = Convert.ToByte(frame.Substring(2, 2), 16);
 
-            int highNibble = (b1 >> 4) & 0x0F; // 0..15
+            int highNibble = (b1 >> 4) & 0x0F; // 0x4, 0x5, 0x9, ...
             int coinType = b1 & 0x0F;
 
-            // MDB interpretation:
-            // highNibble bits (h3 h2 h1 h0):
-            // 00xx -> cashbox
-            // 01xx -> to tube
-            // 10xx -> dispensed from tube
-            // 11xx -> rejected / invalid
             CoinRoute route;
-            int routeClass = highNibble & 0b1100; // patrzymy na 2 najstarsze bity nibble'a
-
-            if (routeClass == 0b0000)
-                route = CoinRoute.ToCashbox;
-            else if (routeClass == 0b0100)
-                route = CoinRoute.ToTube;
-            else if (routeClass == 0b1000)
-                route = CoinRoute.Dispensed;
-            else
+            switch (highNibble)
             {
-                // 11xx – odrzucone / nieobsługiwane
-                _logger.LogInformation(
-                    "[MDB COIN] coin rejected/unsupported, highNibble={HighNibble:X}, type={CoinType}, frame={Frame}",
-                    highNibble, coinType, frame);
-                return;
+                case 0x4:
+                    route = CoinRoute.ToCashbox;
+                    break;
+                case 0x5:
+                    route = CoinRoute.ToTube;
+                    break;
+                case 0x9:
+                    route = CoinRoute.Dispensed;
+                    break;
+                default:
+                    _logger.LogInformation(
+                        "[MDB COIN] unsupported/unknown highNibble={HighNibble:X}, coinType={CoinType}, frame={Frame}",
+                        highNibble, coinType, frame);
+                    return; // nic nie robimy dla nieznanych ramek
             }
 
             _logger.LogDebug(
@@ -237,7 +232,7 @@ namespace ITBees.Mdb
                         "[MDB COIN] coin to tube: value={Value} gr, type={CoinType}",
                         amountInCents, coinType);
 
-                    // Nowa moneta w tubach (źródło: klient)
+                    // nowa moneta w tubach
                     _ = _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents);
 
                     var evt = new DeviceEventArgs(
@@ -256,7 +251,7 @@ namespace ITBees.Mdb
                         "[MDB COIN] coin dispensed from tube: value={Value} gr, type={CoinType}",
                         amountInCents, coinType);
 
-                    // Moneta ubyła z tub (przycisk A/B/C lub wydanie reszty)
+                    // moneta ubyła z tub (przycisk / reszta)
                     _ = _cashInventoryService.RegisterCoinDispensedAsync(amountInCents);
 
                     var evt = new DeviceEventArgs(
@@ -275,7 +270,7 @@ namespace ITBees.Mdb
                         "[MDB COIN] coin to cashbox: value={Value} gr, type={CoinType}",
                         amountInCents, coinType);
 
-                    // Moneta w cashboxie (nie do wydawania reszty)
+                    // moneta w cashboxie (nie do wydawania reszty)
                     _ = _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents);
 
                     var evt = new DeviceEventArgs(
