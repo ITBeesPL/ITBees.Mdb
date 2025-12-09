@@ -139,7 +139,7 @@ namespace ITBees.Mdb
 
         private async Task HandleBillAsync(int amt, CancellationToken token)
         {
-            await _liveLogger.LogErrorMessage("Handle bill, amount :" + amt);
+            await _liveLogger.LogMessage("Handle bill, amount :" + amt);
             _escrowDecision = new TaskCompletionSource<bool>();
             DeviceEvent?.Invoke(this,
                 new DeviceEventArgs(DeviceEventType.CashEscrowRequested,
