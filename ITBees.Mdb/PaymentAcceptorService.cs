@@ -9,6 +9,8 @@ namespace ITBees.Mdb
 {
     public class PaymentAcceptorService : IPaymentAcceptorService
     {
+        private readonly Dictionary<int, TaskCompletionSource<bool>> _dispenseWaiters = new();
+        private readonly object _dispenseWaitersLock = new();
         private readonly ISerialDevice _device;
         private readonly ILogger<PaymentAcceptorService> _logger;
         private readonly ILiveLogListener _liveLogger;
@@ -249,7 +251,8 @@ namespace ITBees.Mdb
                         PaymentType.Coin,
                         amountInCents,
                         targetCashHolder: DeviceEventType.CoinDispensed));
-
+                    
+                    SignalDispensed(amountInCents);
                     break;
                 }
 
@@ -267,7 +270,18 @@ namespace ITBees.Mdb
                 }
             }
         }
-
+        
+        private void SignalDispensed(int valueInCents)
+        {
+            TaskCompletionSource<bool>? tcs = null;
+            lock (_dispenseWaitersLock)
+            {
+                if (_dispenseWaiters.TryGetValue(valueInCents, out tcs))
+                    _dispenseWaiters.Remove(valueInCents);
+            }
+            tcs?.TrySetResult(true);
+        }
+        
         public void ResetDeviceCoinState()
         {
             try
@@ -353,10 +367,10 @@ namespace ITBees.Mdb
                 {
                     _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
 
-                    bool ok = DispenseCoin(coinValue);
-
-                    Thread.Sleep(500);
-
+                    bool ok = await DispenseCoinAsync(coinValue);
+                    
+                    await Task.Delay(200);
+                    
                     if (!ok)
                     {
                         _liveLogger.LogErrorMessage(
@@ -382,40 +396,74 @@ namespace ITBees.Mdb
             _debugVerboseLogging = enable;
         }
 
-        public bool DispenseCoin(int value)
+       public async Task<bool> DispenseCoinAsync(int value, CancellationToken ct = default)
+{
+    if (!_coinValueToType.TryGetValue(value, out var coinType))
+    {
+        _logger.LogWarning("DispenseCoin: unknown coin value {Value} gr", value);
+        return false;
+    }
+
+    var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    lock (_dispenseWaitersLock)
+    {
+        // Jeśli ktoś już czeka na tę samą monetę, to znaczy że masz race w logice wypłaty
+        _dispenseWaiters[value] = tcs;
+    }
+
+    byte param = (byte)(0x10 | (coinType & 0x0F));
+
+    string line;
+    lock (_ioLock)
+    {
+        _liveLogger.LogMessage(
+            $"Sending payout for {value} gr (coinType={coinType}, param=0x{param:X2})").Wait();
+
+        _device.Write($"R,0D,{param:X2}");
+        line = ReadLineLogged("DispenseCoin");
+    }
+
+    bool ack = line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
+    if (!ack)
+    {
+        lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
+
+        _liveLogger.LogErrorMessage(
+            $"DispenseCoin failed for {value} gr (coinType={coinType}), device response: {line}").Wait();
+        _logger.LogWarning(
+            "DispenseCoin failed for value={Value} gr, type={CoinType}, deviceResponse={Response}",
+            value, coinType, line);
+        return false;
+    }
+
+    // Teraz deterministycznie dopolluj, aż zobaczysz ramkę dispensed (0x9*)
+    var timeoutAt = DateTime.UtcNow.AddSeconds(3);
+
+    while (DateTime.UtcNow < timeoutAt && !ct.IsCancellationRequested)
+    {
+        string coins;
+        lock (_ioLock)
         {
-            if (!_coinValueToType.TryGetValue(value, out var coinType))
-            {
-                _logger.LogWarning("DispenseCoin: unknown coin value {Value} gr", value);
-                return false;
-            }
+            _device.Write("R,0B");
+            coins = ReadLineLogged("PollCoinsAfterDispense");
+        }
 
-            byte param = (byte)(0x10 | (coinType & 0x0F));
+        await HandleCoinsAsync(coins).ConfigureAwait(false);
 
-            string line;
-            lock (_ioLock)
-            {
-                _liveLogger.LogMessage(
-                    $"Sending payout for {value} gr (coinType={coinType}, param=0x{param:X2})").Wait();
-
-                _device.Write($"R,0D,{param:X2}");
-                line = ReadLineLogged("DispenseCoin");
-            }
-
-            bool success = line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase);
-
-            if (!success)
-            {
-                _liveLogger.LogErrorMessage(
-                    $"DispenseCoin failed for {value} gr (coinType={coinType}), device response: {line}").Wait();
-                _logger.LogWarning(
-                    "DispenseCoin failed for value={Value} gr, type={CoinType}, deviceResponse={Response}",
-                    value, coinType, line);
-                return false;
-            }
-
+        var completed = await Task.WhenAny(tcs.Task, Task.Delay(80, ct)).ConfigureAwait(false);
+        if (completed == tcs.Task)
+        {
+            await _cashInventoryService.FlushAsync().ConfigureAwait(false);
             return true;
         }
+    }
+
+    // Timeout: nie przyszła ramka. Sprzątamy waitera.
+    lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
+
+    _logger.LogWarning("DispenseCoinAsync timeout waiting for dispensed frame for {Value} gr", value);
+    return false;
+}
 
         public void ShowTubeStatus()
         {
