@@ -115,7 +115,7 @@ namespace ITBees.Mdb
                             HandleBills(ReadLineLogged("PollBills"));
 
                             _device.Write("R,0B");
-                            HandleCoins(ReadLineLogged("PollCoins"));
+                            HandleCoinsAsync(ReadLineLogged("PollCoins")).ConfigureAwait(false);
                         }
                     }
                 }
@@ -159,20 +159,24 @@ namespace ITBees.Mdb
             ReadLineLogged();
             await _liveLogger.LogMessage($"Bill {amt}" + (accept ? "accepted" : "returned"));
 
-            DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.CashProcessed,
-                    PaymentType.Cash, amt, accept));
-
             if (accept)
             {
                 await _cashInventoryService.RegisterBanknoteAcceptedAsync(amt);
+                await _cashInventoryService.FlushAsync();
             }
+
+            DeviceEvent?.Invoke(this,
+                new DeviceEventArgs(
+                    DeviceEventType.CashProcessed,
+                    PaymentType.Cash,
+                    amt,
+                    accept));
         }
 
         private static readonly Regex _frame4 = new(@"[0-9A-Fa-f]{4}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-        private void HandleCoins(string data)
+        private async Task HandleCoinsAsync(string data)
         {
             if (string.IsNullOrEmpty(data) || !data.StartsWith("p,")) return;
 
@@ -181,10 +185,10 @@ namespace ITBees.Mdb
                 .ToArray());
 
             foreach (Match m in _frame4.Matches(hex))
-                ProcessSingleCoinFrame(m.Value);
+                await ProcessSingleCoinFrameAsync(m.Value).ConfigureAwait(false);
         }
 
-        private void ProcessSingleCoinFrame(string frame)
+        private async Task ProcessSingleCoinFrameAsync(string frame)
         {
             if (string.IsNullOrWhiteSpace(frame) || frame.Length != 4)
                 return;
@@ -192,31 +196,21 @@ namespace ITBees.Mdb
             byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
             byte b2 = Convert.ToByte(frame.Substring(2, 2), 16);
 
-            int highNibble = (b1 >> 4) & 0x0F; // 0x4, 0x5, 0x9, ...
+            int highNibble = (b1 >> 4) & 0x0F;
             int coinType = b1 & 0x0F;
 
             CoinRoute route;
             switch (highNibble)
             {
-                case 0x4:
-                    route = CoinRoute.ToCashbox;
-                    break;
-                case 0x5:
-                    route = CoinRoute.ToTube;
-                    break;
-                case 0x9:
-                    route = CoinRoute.Dispensed;
-                    break;
+                case 0x4: route = CoinRoute.ToCashbox; break;
+                case 0x5: route = CoinRoute.ToTube; break;
+                case 0x9: route = CoinRoute.Dispensed; break;
                 default:
                     _logger.LogInformation(
                         "[MDB COIN] unsupported/unknown highNibble={HighNibble:X}, coinType={CoinType}, frame={Frame}",
                         highNibble, coinType, frame);
-                    return; // nic nie robimy dla nieznanych ramek
+                    return;
             }
-
-            _logger.LogDebug(
-                "[MDB COIN FRAME] raw={Frame} b1={B1:X2} b2={B2:X2} highNibble={HighNibble:X} route={Route} coinType={CoinType}",
-                frame, b1, b2, highNibble, route, coinType);
 
             if (!_coinTypeToValue.TryGetValue(coinType, out var amountInCents))
             {
@@ -228,58 +222,40 @@ namespace ITBees.Mdb
             {
                 case CoinRoute.ToTube:
                 {
-                    _logger.LogInformation(
-                        "[MDB COIN] coin to tube: value={Value} gr, type={CoinType}",
-                        amountInCents, coinType);
+                    await _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents).ConfigureAwait(false);
 
-                    // nowa moneta w tubach
-                    _ = _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents);
-
-                    var evt = new DeviceEventArgs(
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
                         DeviceEventType.CoinReceived,
                         PaymentType.Coin,
                         amountInCents,
-                        targetCashHolder: DeviceEventType.CoinReceived);
+                        targetCashHolder: DeviceEventType.CoinReceived));
 
-                    DeviceEvent?.Invoke(this, evt);
                     break;
                 }
 
                 case CoinRoute.Dispensed:
                 {
-                    _logger.LogInformation(
-                        "[MDB COIN] coin dispensed from tube: value={Value} gr, type={CoinType}",
-                        amountInCents, coinType);
+                    await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
 
-                    // moneta ubyła z tub (przycisk / reszta)
-                    _ = _cashInventoryService.RegisterCoinDispensedAsync(amountInCents);
-
-                    var evt = new DeviceEventArgs(
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
                         DeviceEventType.CoinDispensed,
                         PaymentType.Coin,
                         amountInCents,
-                        targetCashHolder: DeviceEventType.CoinDispensed);
+                        targetCashHolder: DeviceEventType.CoinDispensed));
 
-                    DeviceEvent?.Invoke(this, evt);
                     break;
                 }
 
                 case CoinRoute.ToCashbox:
                 {
-                    _logger.LogInformation(
-                        "[MDB COIN] coin to cashbox: value={Value} gr, type={CoinType}",
-                        amountInCents, coinType);
+                    await _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents).ConfigureAwait(false);
 
-                    // moneta w cashboxie (nie do wydawania reszty)
-                    _ = _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents);
-
-                    var evt = new DeviceEventArgs(
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
                         DeviceEventType.CoinToCashbox,
                         PaymentType.Coin,
                         amountInCents,
-                        targetCashHolder: DeviceEventType.CoinToCashbox);
+                        targetCashHolder: DeviceEventType.CoinToCashbox));
 
-                    DeviceEvent?.Invoke(this, evt);
                     break;
                 }
             }
@@ -429,11 +405,6 @@ namespace ITBees.Mdb
                     value, coinType, line);
                 return false;
             }
-
-            DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
-
-            _ = _cashInventoryService.RegisterCoinDispensedAsync(value);
 
             return true;
         }

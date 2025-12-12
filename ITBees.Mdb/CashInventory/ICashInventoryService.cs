@@ -11,4 +11,8 @@ public interface ICashInventoryService
     Task ResetCoinsAsync();
     Task RegisterCoinToCashboxAcceptedAsync(int nominalInGrosze);
     Task ResetCoinsInCashboxAsync();
+    /// <summary>
+    /// Ensures all previous writes are visible before snapshot.
+    /// </summary>
+    Task FlushAsync();
 }

@@ -16,7 +16,16 @@ public sealed class FileCashInventoryService : ICashInventoryService
         _filePath = ResolveFilePath();
         _stateVm = LoadFromFile();
     }
-
+    
+    public Task FlushAsync()
+    {
+        lock (_lock)
+        {
+            // no-op, just ensure previous writes are visible
+        }
+        return Task.CompletedTask;
+    }
+    
     public Task RegisterBanknoteAcceptedAsync(int nominalInGrosze)
     {
         if (nominalInGrosze <= 0) return Task.CompletedTask;
