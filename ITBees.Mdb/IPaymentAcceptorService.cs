@@ -7,7 +7,7 @@ public interface IPaymentAcceptorService
     void Stop();
     void Accept();
     void Return();
-    bool DispenseChange(int amount);
+    Task<bool> DispenseChangeAsync(int amount);
     bool DeviceRunning();
     void EnableVerboseDebugLogging(bool enable);
 }

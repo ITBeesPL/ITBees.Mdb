@@ -109,20 +109,27 @@ namespace ITBees.Mdb
                 {
                     if (!_cashlessBusy)
                     {
+                        string bills;
+                        string coins;
+
                         lock (_ioLock)
                         {
                             _device.Write("R,33");
-                            HandleBills(ReadLineLogged("PollBills"));
+                            bills = ReadLineLogged("PollBills");
 
                             _device.Write("R,0B");
-                            HandleCoinsAsync(ReadLineLogged("PollCoins")).ConfigureAwait(false);
+                            coins = ReadLineLogged("PollCoins");
                         }
+
+                        HandleBills(bills);
+                        await HandleCoinsAsync(coins);
                     }
                 }
                 catch (Exception ex)
                 {
                     EmitError(ex.Message);
-                    _liveLogger.LogErrorMessage("Error on PollLoop, message " + ex.Message).Wait();
+                    await _liveLogger.LogErrorMessage(
+                        "Error on PollLoop, message " + ex.Message);
                 }
 
                 await Task.Delay(200, _cts.Token);
@@ -285,7 +292,7 @@ namespace ITBees.Mdb
         public void Accept() => _escrowDecision?.TrySetResult(true);
         public void Return() => _escrowDecision?.TrySetResult(false);
 
-        public bool DispenseChange(int amount)
+        public async Task<bool> DispenseChangeAsync(int amount)
         {
             _liveLogger.LogMessage("Dispensing change: " + amount + " gr").Wait();
 
@@ -361,6 +368,7 @@ namespace ITBees.Mdb
                 }
             }
 
+            await _cashInventoryService.FlushAsync();
             return true;
         }
 
