@@ -752,12 +752,18 @@ namespace ITBees.Mdb
                 _coinTypeToValue.Clear();
                 _coinValueToType.Clear();
 
-                _coinScalingFactor = bytes[3] == 0 ? 1 : bytes[3];
-                _coinDecimalPlaces = bytes[4];
+                _coinScalingFactor = bytes.Length > 3 && bytes[3] != 0 ? bytes[3] : 1;
+                _coinDecimalPlaces = bytes.Length > 4 ? bytes[4] : 2;
 
-                for (int coinType = 0; coinType < 16 && (7 + coinType) < bytes.Length; coinType++)
+                byte[] credits;
+                if (bytes.Length >= 16)
+                    credits = bytes.Skip(bytes.Length - 16).Take(16).ToArray();
+                else
+                    credits = Array.Empty<byte>();
+
+                for (int coinType = 0; coinType < credits.Length; coinType++)
                 {
-                    byte credit = bytes[7 + coinType];
+                    byte credit = credits[coinType];
                     if (credit == 0 || credit == 0xFF)
                         continue;
 
@@ -769,8 +775,10 @@ namespace ITBees.Mdb
                 }
 
                 _liveLogger.LogMessage(
-                        $"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}")
-                    .Wait();
+                    $"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}").Wait();
+
+                foreach (var kv in _coinTypeToValue.OrderBy(x => x.Key))
+                    _logger.LogInformation("[MDB COIN] coinType={CoinType} => {Value} gr", kv.Key, kv.Value);
             }
             catch (Exception ex)
             {
