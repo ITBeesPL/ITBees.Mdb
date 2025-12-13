@@ -16,6 +16,9 @@ namespace ITBees.Mdb
         private readonly object _ioLock = new();
         private volatile bool _payoutBusy;
 
+        private readonly object _dispenseWaitersLock = new();
+        private readonly Dictionary<int, TaskCompletionSource<bool>> _dispenseWaiters = new();
+
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
 
         private readonly Dictionary<int, int> _coinTypeToValue = new();
@@ -202,7 +205,6 @@ namespace ITBees.Mdb
                 return;
 
             byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
-            byte b2 = Convert.ToByte(frame.Substring(2, 2), 16);
 
             int highNibble = (b1 >> 4) & 0x0F;
             int coinType = b1 & 0x0F;
@@ -231,6 +233,7 @@ namespace ITBees.Mdb
                 case CoinRoute.ToTube:
                 {
                     await _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
 
                     DeviceEvent?.Invoke(this, new DeviceEventArgs(
                         DeviceEventType.CoinReceived,
@@ -243,15 +246,32 @@ namespace ITBees.Mdb
 
                 case CoinRoute.Dispensed:
                 {
-                    // ignore, device may emit it in some firmwares; accounting is done on payout ACK
-                    _logger.LogDebug("[MDB COIN] dispensed frame ignored (accounting is ACK-based). frame={Frame}",
-                        frame);
+                    await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinDispensed,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinDispensed));
+
+                    TaskCompletionSource<bool>? tcs = null;
+                    lock (_dispenseWaitersLock)
+                    {
+                        if (_dispenseWaiters.TryGetValue(amountInCents, out tcs))
+                        {
+                            _dispenseWaiters.Remove(amountInCents);
+                        }
+                    }
+                    tcs?.TrySetResult(true);
+
                     break;
                 }
 
                 case CoinRoute.ToCashbox:
                 {
                     await _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
 
                     DeviceEvent?.Invoke(this, new DeviceEventArgs(
                         DeviceEventType.CoinToCashbox,
@@ -366,11 +386,16 @@ namespace ITBees.Mdb
                     }
                 }
 
-                await _cashInventoryService.FlushAsync();
                 return true;
             }
             finally
             {
+                lock (_dispenseWaitersLock)
+                {
+                    foreach (var kv in _dispenseWaiters.Values)
+                        kv.TrySetResult(false);
+                    _dispenseWaiters.Clear();
+                }
                 _payoutBusy = false;
             }
         }
@@ -393,6 +418,12 @@ namespace ITBees.Mdb
                 return false;
             }
 
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_dispenseWaitersLock)
+            {
+                _dispenseWaiters[value] = tcs;
+            }
+
             byte param = (byte)(0x10 | (coinType & 0x0F));
 
             string line;
@@ -407,17 +438,42 @@ namespace ITBees.Mdb
 
             if (!line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase))
             {
+                lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
                 _logger.LogWarning("DispenseCoin failed for {Value} gr", value);
                 return false;
             }
 
-            // ⬇⬇⬇ TO JEST KLUCZ ⬇⬇⬇
-            await _cashInventoryService.RegisterCoinDispensedAsync(value);
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (tcs.Task.IsCompleted)
+                    break;
 
-            DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
+                string coins;
+                lock (_ioLock)
+                {
+                    _device.Write("R,0B");
+                    coins = ReadLineLogged("PollCoinsAfterPayout");
+                }
 
-            return true;
+                await HandleCoinsAsync(coins).ConfigureAwait(false);
+
+                if (tcs.Task.IsCompleted)
+                    break;
+
+                await Task.Delay(80).ConfigureAwait(false);
+            }
+
+            bool ok = false;
+            if (tcs.Task.IsCompleted)
+                ok = await tcs.Task.ConfigureAwait(false);
+
+            if (!ok)
+            {
+                lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
+            }
+
+            return ok;
         }
 
         public void ShowTubeStatus()
