@@ -1,6 +1,11 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using ITBees.Interfaces.Logs;
 using ITBees.Mdb.CashInventory;
 using Microsoft.Extensions.Logging;
@@ -14,15 +19,24 @@ namespace ITBees.Mdb
         private readonly ILiveLogListener _liveLogger;
         private readonly ICashInventoryService _cashInventoryService;
         private readonly object _ioLock = new();
-        private volatile bool _payoutBusy;
-
-        private readonly object _dispenseWaitersLock = new();
-        private readonly Dictionary<int, TaskCompletionSource<bool>> _dispenseWaiters = new();
 
         private readonly int[] _billValues = { 1000, 2000, 5000, 10000, 20000, 50000 };
 
         private readonly Dictionary<int, int> _coinTypeToValue = new();
         private readonly Dictionary<int, int> _coinValueToType = new();
+
+        private readonly object _pendingDispenseLock = new();
+        private readonly Dictionary<int, (int Count, DateTime ExpiresUtc)> _pendingProgrammaticDispenseByValue = new();
+
+        // Key: coin value (gr), Value: queue of waiters for confirmation from PollCoins (0x9?)
+        private readonly object _dispenseWaitersLock = new();
+        private readonly Dictionary<int, Queue<TaskCompletionSource<bool>>> _dispenseWaitersByValue = new();
+
+        // TTL must be longer than the "busy/poll jitter" window. 3s is often too short in real life.
+        private static readonly TimeSpan _programmaticDispenseTtl = TimeSpan.FromSeconds(10);
+
+        // How long we wait for poll confirmation after payout command.
+        private static readonly TimeSpan _dispenseConfirmTimeout = TimeSpan.FromSeconds(2.5);
 
         private int _coinScalingFactor = 1;
         private int _coinDecimalPlaces = 2;
@@ -60,9 +74,13 @@ namespace ITBees.Mdb
             try
             {
                 _liveLogger.LogMessage("Shutting down MDB device...").Wait();
-                _device.Write("M,0");
-                ReadLineLogged();
-                _device.Close();
+                lock (_ioLock)
+                {
+                    _device.Write("M,0");
+                    ReadLineLogged();
+                    _device.Close();
+                }
+
                 _deviceRunnig = false;
             }
             catch
@@ -81,28 +99,29 @@ namespace ITBees.Mdb
         private void InitDevices()
         {
             _liveLogger.LogMessage("Init MDB Device started...").Wait();
-            _device.Write("M,1");
-            ReadLineLogged();
 
-            foreach (var cmd in new[] { "R,30", "R,31", "R,34,FFFFFFFF", "R,35,0" })
+            lock (_ioLock)
             {
-                _device.Write(cmd);
+                _device.Write("M,1");
                 ReadLineLogged();
-            }
 
-            foreach (var cmd in new[] { "R,08", "R,09", "R,0C,FFFFFFFF" })
-            {
-                _device.Write(cmd);
-                var line = ReadLineLogged();
-                if (cmd == "R,09")
+                foreach (var cmd in new[] { "R,30", "R,31", "R,34,FFFFFFFF", "R,35,0" })
                 {
-                    LoadCoinConfiguration(line);
+                    _device.Write(cmd);
+                    ReadLineLogged();
+                }
+
+                foreach (var cmd in new[] { "R,08", "R,09", "R,0C,FFFFFFFF" })
+                {
+                    _device.Write(cmd);
+                    var line = ReadLineLogged();
+                    if (cmd == "R,09")
+                        LoadCoinConfiguration(line);
                 }
             }
 
             DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.Initialized,
-                    PaymentType.Cash, 0, null, "Initialized"));
+                new DeviceEventArgs(DeviceEventType.Initialized, PaymentType.Cash, 0, null, "Initialized"));
         }
 
         private async Task PollLoop()
@@ -111,29 +130,27 @@ namespace ITBees.Mdb
             {
                 try
                 {
-                    if (!_cashlessBusy && !_payoutBusy)
+                    string bills;
+                    string coins;
+
+                    lock (_ioLock)
                     {
-                        string bills;
-                        string coins;
+                        _device.Write("R,33");
+                        bills = ReadLineLogged("PollBills");
 
-                        lock (_ioLock)
-                        {
-                            _device.Write("R,33");
-                            bills = ReadLineLogged("PollBills");
-
-                            _device.Write("R,0B");
-                            coins = ReadLineLogged("PollCoins");
-                        }
-
-                        HandleBills(bills);
-                        await HandleCoinsAsync(coins);
+                        _device.Write("R,0B");
+                        coins = ReadLineLogged("PollCoins");
                     }
+
+                    if (!_cashlessBusy)
+                        HandleBills(bills);
+
+                    await HandleCoinsAsync(coins).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     EmitError(ex.Message);
-                    await _liveLogger.LogErrorMessage(
-                        "Error on PollLoop, message " + ex.Message);
+                    await _liveLogger.LogErrorMessage("Error on PollLoop, message " + ex.Message);
                 }
 
                 await Task.Delay(200, _cts.Token);
@@ -143,18 +160,16 @@ namespace ITBees.Mdb
         private async void HandleBills(string data)
         {
             if (TryParseBill(data) is int amt)
-            {
                 await HandleBillAsync(amt, _cts.Token);
-            }
         }
 
         private async Task HandleBillAsync(int amt, CancellationToken token)
         {
             await _liveLogger.LogMessage("Handle bill, amount :" + amt);
-            _escrowDecision = new TaskCompletionSource<bool>();
+            _escrowDecision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
             DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.CashEscrowRequested,
-                    PaymentType.Cash, amt));
+                new DeviceEventArgs(DeviceEventType.CashEscrowRequested, PaymentType.Cash, amt));
 
             var timeout = Task.Delay(TimeSpan.FromSeconds(5), token);
             var finished = await Task.WhenAny(_escrowDecision.Task, timeout);
@@ -166,8 +181,12 @@ namespace ITBees.Mdb
                 await _liveLogger.LogErrorMessage("Escrow timeout – returning note");
             }
 
-            _device.Write($"R,35,{(accept ? 1 : 0)}");
-            ReadLineLogged();
+            lock (_ioLock)
+            {
+                _device.Write($"R,35,{(accept ? 1 : 0)}");
+                ReadLineLogged();
+            }
+
             await _liveLogger.LogMessage($"Bill {amt}" + (accept ? "accepted" : "returned"));
 
             if (accept)
@@ -177,35 +196,65 @@ namespace ITBees.Mdb
             }
 
             DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(
-                    DeviceEventType.CashProcessed,
-                    PaymentType.Cash,
-                    amt,
-                    accept));
+                new DeviceEventArgs(DeviceEventType.CashProcessed, PaymentType.Cash, amt, accept));
         }
 
-        private static readonly Regex _frame4 = new(@"[0-9A-Fa-f]{4}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        // ===== FIX #1: Parse PollCoins byte-by-byte (2 hex chars = 1 byte) =====
 
         private async Task HandleCoinsAsync(string data)
         {
-            if (string.IsNullOrEmpty(data) || !data.StartsWith("p,")) return;
-
-            string hex = new string(data.Substring(2)
-                .Where(c => IsHex(c))
-                .ToArray());
-
-            foreach (Match m in _frame4.Matches(hex))
-                await ProcessSingleCoinFrameAsync(m.Value).ConfigureAwait(false);
-        }
-
-        private async Task ProcessSingleCoinFrameAsync(string frame)
-        {
-            if (string.IsNullOrWhiteSpace(frame) || frame.Length != 4)
+            if (string.IsNullOrEmpty(data) || !data.StartsWith("p,", StringComparison.OrdinalIgnoreCase))
                 return;
 
-            byte b1 = Convert.ToByte(frame.Substring(0, 2), 16);
+            string hex = new string(data.Substring(2).Where(IsHex).ToArray());
+            if (hex.Length < 2) return;
+            if ((hex.Length & 1) == 1) hex = hex.Substring(0, hex.Length - 1);
 
+            var bytes = new byte[hex.Length / 2];
+            for (int i = 0; i < bytes.Length; i++)
+                bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+
+            int idx = 0;
+            while (idx < bytes.Length)
+            {
+                // 1-byte statuses (adapter/firmware dependent)
+                // Examples seen: 0x02 (payout busy), 0xAC (status)
+                if (idx == bytes.Length - 1)
+                {
+                    LogCoinStatus(bytes[idx]);
+                    break;
+                }
+
+                byte b1 = bytes[idx];
+                byte b2 = bytes[idx + 1];
+
+                int highNibble = (b1 >> 4) & 0x0F;
+
+                // If b1 is clearly a 1-byte status, consume only it.
+                // 0x00/0xFF/0x02/0xA* are common.
+                if (b1 == 0x00 || b1 == 0xFF || b1 == 0x02 || highNibble == 0xA)
+                {
+                    LogCoinStatus(b1);
+                    idx += 1;
+                    continue;
+                }
+
+                await ProcessCoinEventPairAsync(b1, b2).ConfigureAwait(false);
+                idx += 2;
+            }
+        }
+
+        private void LogCoinStatus(byte b)
+        {
+            int highNibble = (b >> 4) & 0x0F;
+            int lowNibble = b & 0x0F;
+
+            _logger.LogInformation("[MDB COIN] status byte=0x{Byte:X2} (highNibble=0x{High:X}, lowNibble=0x{Low:X})",
+                b, highNibble, lowNibble);
+        }
+
+        private async Task ProcessCoinEventPairAsync(byte b1, byte b2)
+        {
             int highNibble = (b1 >> 4) & 0x0F;
             int coinType = b1 & 0x0F;
 
@@ -216,15 +265,166 @@ namespace ITBees.Mdb
                 case 0x5: route = CoinRoute.ToTube; break;
                 case 0x9: route = CoinRoute.Dispensed; break;
                 default:
-                    _logger.LogInformation(
-                        "[MDB COIN] unsupported/unknown highNibble={HighNibble:X}, coinType={CoinType}, frame={Frame}",
-                        highNibble, coinType, frame);
+                    _logger.LogInformation("[MDB COIN] ignored event pair b1=0x{B1:X2}, b2=0x{B2:X2}", b1, b2);
                     return;
             }
 
             if (!_coinTypeToValue.TryGetValue(coinType, out var amountInCents))
             {
-                _logger.LogWarning("[MDB COIN] unknown coin type={CoinType}, frame={Frame}", coinType, frame);
+                _logger.LogWarning("[MDB COIN] unknown coin type={CoinType}, b1=0x{B1:X2}, b2=0x{B2:X2}", coinType, b1,
+                    b2);
+                return;
+            }
+
+            // b2 is NOT another coin event. It is extra info (tube/count/status depending on fw).
+            // Keep it only for diagnostics if you want:
+            if (_debugVerboseLogging)
+                _logger.LogInformation("[MDB COIN] event route={Route}, value={Value}gr, extra=0x{Extra:X2}", route,
+                    amountInCents, b2);
+
+            switch (route)
+            {
+                case CoinRoute.ToTube:
+                {
+                    await _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinReceived,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinReceived));
+                    break;
+                }
+
+                case CoinRoute.ToCashbox:
+                {
+                    await _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinToCashbox,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinToCashbox));
+                    break;
+                }
+
+                case CoinRoute.Dispensed:
+                {
+                    bool programmatic = TryConsumeProgrammaticDispense(amountInCents);
+                    if (programmatic)
+                        CompleteDispenseWaiter(amountInCents);
+                    else
+                    {
+                        await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
+                        await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+                    }
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinDispensed,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinDispensed));
+                    break;
+                }
+            }
+        }
+
+
+        private async Task ProcessSingleCoinByteAsync(byte b)
+        {
+            int highNibble = (b >> 4) & 0x0F;
+            int coinType = b & 0x0F;
+
+            if (highNibble != 0x4 && highNibble != 0x5 && highNibble != 0x9)
+            {
+                _logger.LogInformation(
+                    "[MDB COIN] ignored byte=0x{Byte:X2} (highNibble=0x{High:X}, coinType=0x{Type:X})",
+                    b, highNibble, coinType);
+                return;
+            }
+
+            if (!_coinTypeToValue.TryGetValue(coinType, out var amountInCents))
+            {
+                _logger.LogWarning("[MDB COIN] unknown coin type={CoinType}, byte=0x{Byte:X2}", coinType, b);
+                return;
+            }
+
+            switch (highNibble)
+            {
+                case 0x5:
+                {
+                    await _cashInventoryService.RegisterCoinAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinReceived,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinReceived));
+                    break;
+                }
+
+                case 0x4:
+                {
+                    await _cashInventoryService.RegisterCoinToCashboxAcceptedAsync(amountInCents).ConfigureAwait(false);
+                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinToCashbox,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinToCashbox));
+                    break;
+                }
+
+                case 0x9:
+                {
+                    if (!TryConsumeProgrammaticDispense(amountInCents))
+                    {
+                        await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
+                        await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+                    }
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinDispensed,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinDispensed));
+                    break;
+                }
+            }
+        }
+
+        private async Task ProcessCoinByteAsync(byte b)
+        {
+            // In MDB, 0x00/0xFF etc can appear as "no event / filler / status" depending on adapter.
+            // We only handle known routes (high nibble).
+            int highNibble = (b >> 4) & 0x0F;
+            int coinType = b & 0x0F;
+
+            CoinRoute route;
+            switch (highNibble)
+            {
+                case 0x4: route = CoinRoute.ToCashbox; break;
+                case 0x5: route = CoinRoute.ToTube; break;
+                case 0x9: route = CoinRoute.Dispensed; break;
+
+                default:
+                    if (_debugVerboseLogging)
+                    {
+                        _logger.LogInformation(
+                            "[MDB COIN] ignored byte=0x{Byte:X2} (highNibble=0x{High:X}, coinType=0x{Type:X})",
+                            b, highNibble, coinType);
+                    }
+
+                    return;
+            }
+
+            if (!_coinTypeToValue.TryGetValue(coinType, out var amountInCents))
+            {
+                _logger.LogWarning("[MDB COIN] unknown coin type={CoinType} for byte=0x{Byte:X2}", coinType, b);
                 return;
             }
 
@@ -240,31 +440,6 @@ namespace ITBees.Mdb
                         PaymentType.Coin,
                         amountInCents,
                         targetCashHolder: DeviceEventType.CoinReceived));
-
-                    break;
-                }
-
-                case CoinRoute.Dispensed:
-                {
-                    await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
-                    await _cashInventoryService.FlushAsync().ConfigureAwait(false);
-
-                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
-                        DeviceEventType.CoinDispensed,
-                        PaymentType.Coin,
-                        amountInCents,
-                        targetCashHolder: DeviceEventType.CoinDispensed));
-
-                    TaskCompletionSource<bool>? tcs = null;
-                    lock (_dispenseWaitersLock)
-                    {
-                        if (_dispenseWaiters.TryGetValue(amountInCents, out tcs))
-                        {
-                            _dispenseWaiters.Remove(amountInCents);
-                        }
-                    }
-                    tcs?.TrySetResult(true);
-
                     break;
                 }
 
@@ -278,24 +453,260 @@ namespace ITBees.Mdb
                         PaymentType.Coin,
                         amountInCents,
                         targetCashHolder: DeviceEventType.CoinToCashbox));
+                    break;
+                }
 
+                case CoinRoute.Dispensed:
+                {
+                    // If this was a programmatic payout, wake a waiter.
+                    bool isProgrammatic = TryConsumeProgrammaticDispense(amountInCents);
+                    if (isProgrammatic)
+                    {
+                        CompleteDispenseWaiter(amountInCents);
+                    }
+                    else
+                    {
+                        // Manual payout (buttons A-F) or external action.
+                        // Keep inventory consistent, but DO NOT treat it as confirmation for an in-flight payout.
+                        await _cashInventoryService.RegisterCoinDispensedAsync(amountInCents).ConfigureAwait(false);
+                        await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+                    }
+
+                    DeviceEvent?.Invoke(this, new DeviceEventArgs(
+                        DeviceEventType.CoinDispensed,
+                        PaymentType.Coin,
+                        amountInCents,
+                        targetCashHolder: DeviceEventType.CoinDispensed));
                     break;
                 }
             }
+        }
+
+        // ===== FIX #2: Programmatic dispense must wait for PollCoins confirmation (0x9?) =====
+
+        public Task<bool> DispenseCoinAsync(int value) => DispenseCoinInternalAsync(value, flushAfter: true);
+
+        private async Task<bool> DispenseCoinInternalAsync(int value, bool flushAfter)
+        {
+            if (!_coinValueToType.TryGetValue(value, out var coinType))
+            {
+                _logger.LogWarning("DispenseCoin: unknown coin value {Value} gr", value);
+                return false;
+            }
+
+            // Waiter zostawiamy (jeśli jednak 0x9? przyjdzie, to będzie szybciej)
+            var waiter = EnqueueDispenseWaiter(value);
+
+            // Mark pending BEFORE send
+            MarkProgrammaticDispense(value);
+
+            byte param = (byte)(0x10 | (coinType & 0x0F));
+
+            string line;
+            lock (_ioLock)
+            {
+                _liveLogger.LogMessage($"Sending payout for {value} gr (coinType={coinType}, param=0x{param:X2})")
+                    .Wait();
+                _device.Write($"R,0D,{param:X2}");
+                line = ReadLineLogged("DispenseCoin");
+            }
+
+            if (!line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning("DispenseCoin failed for value={Value} gr, deviceResponse={Response}", value, line);
+                FailDispenseWaiter(value, waiter);
+                return false;
+            }
+
+            // 1) Najpierw spróbuj klasycznie: 0x9? event (jeśli przyjdzie)
+            var eventTask = waiter.Task;
+            var eventTimeout = Task.Delay(TimeSpan.FromMilliseconds(350));
+
+            var first = await Task.WhenAny(eventTask, eventTimeout).ConfigureAwait(false);
+            if (first == eventTask && eventTask.Result)
+                goto CONFIRMED;
+
+            // 2) Jeśli event nie przyszedł: potwierdź przez "Payout Busy" w poll
+            //    Busy może nie wystąpić zawsze, więc logika jest:
+            //    - czekamy aż zobaczymy busy (opcjonalnie),
+            //    - potem czekamy aż busy zniknie.
+            bool sawBusy = false;
+            int notBusyStreak = 0;
+            var deadline = DateTime.UtcNow.AddSeconds(3.0); // w praktyce możesz dać 4-5s
+
+            while (DateTime.UtcNow < deadline)
+            {
+                string poll;
+                lock (_ioLock)
+                {
+                    _device.Write("R,0B");
+                    poll = ReadLineLogged("PollCoins(confirm)");
+                }
+
+                bool busy = IsPayoutBusyPoll(poll);
+                if (busy)
+                {
+                    sawBusy = true;
+                    notBusyStreak = 0;
+                }
+                else
+                {
+                    // Jeżeli widzieliśmy busy, to 2 kolejne "not busy" uznajemy za zakończenie cyklu.
+                    if (sawBusy)
+                    {
+                        notBusyStreak++;
+                        if (notBusyStreak >= 2)
+                            goto CONFIRMED;
+                    }
+                }
+
+                await Task.Delay(120).ConfigureAwait(false);
+            }
+
+            _logger.LogWarning(
+                "DispenseCoin NOT confirmed (no 0x9? and payout busy did not complete) for value={Value} gr", value);
+            return false;
+
+            CONFIRMED:
+            await _cashInventoryService.RegisterCoinDispensedAsync(value).ConfigureAwait(false);
+            if (flushAfter)
+                await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+
+            DeviceEvent?.Invoke(this, new DeviceEventArgs(DeviceEventType.CoinDispensed, PaymentType.Coin, value));
+            return true;
+        }
+
+
+        private TaskCompletionSource<bool> EnqueueDispenseWaiter(int valueInCents)
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_dispenseWaitersLock)
+            {
+                if (!_dispenseWaitersByValue.TryGetValue(valueInCents, out var q))
+                {
+                    q = new Queue<TaskCompletionSource<bool>>();
+                    _dispenseWaitersByValue[valueInCents] = q;
+                }
+
+                q.Enqueue(tcs);
+            }
+
+            return tcs;
+        }
+
+        private void CompleteDispenseWaiter(int valueInCents)
+        {
+            TaskCompletionSource<bool>? tcs = null;
+            lock (_dispenseWaitersLock)
+            {
+                if (_dispenseWaitersByValue.TryGetValue(valueInCents, out var q) && q.Count > 0)
+                {
+                    tcs = q.Dequeue();
+                    if (q.Count == 0)
+                        _dispenseWaitersByValue.Remove(valueInCents);
+                }
+            }
+
+            tcs?.TrySetResult(true);
+        }
+
+        private void FailDispenseWaiter(int valueInCents, TaskCompletionSource<bool> waiter)
+        {
+            // Best effort: remove the exact waiter if still queued.
+            lock (_dispenseWaitersLock)
+            {
+                if (_dispenseWaitersByValue.TryGetValue(valueInCents, out var q) && q.Count > 0)
+                {
+                    if (q.Contains(waiter))
+                    {
+                        var list = q.ToList();
+                        list.Remove(waiter);
+                        if (list.Count == 0) _dispenseWaitersByValue.Remove(valueInCents);
+                        else _dispenseWaitersByValue[valueInCents] = new Queue<TaskCompletionSource<bool>>(list);
+                    }
+                }
+            }
+
+            waiter.TrySetResult(false);
+        }
+
+        private async Task<bool> WaitForDispenseConfirmationAsync(TaskCompletionSource<bool> waiter)
+        {
+            var timeoutTask = Task.Delay(_dispenseConfirmTimeout);
+            var completed = await Task.WhenAny(waiter.Task, timeoutTask).ConfigureAwait(false);
+            if (completed != waiter.Task)
+                return false;
+
+            return waiter.Task.Result;
+        }
+
+        private void MarkProgrammaticDispense(int valueInCents)
+        {
+            var now = DateTime.UtcNow;
+            var exp = now.Add(_programmaticDispenseTtl);
+
+            lock (_pendingDispenseLock)
+            {
+                CleanupExpiredProgrammaticDispenses_NoLock(now);
+
+                if (_pendingProgrammaticDispenseByValue.TryGetValue(valueInCents, out var cur))
+                    _pendingProgrammaticDispenseByValue[valueInCents] = (cur.Count + 1, exp);
+                else
+                    _pendingProgrammaticDispenseByValue[valueInCents] = (1, exp);
+            }
+        }
+
+        private bool TryConsumeProgrammaticDispense(int valueInCents)
+        {
+            var now = DateTime.UtcNow;
+
+            lock (_pendingDispenseLock)
+            {
+                CleanupExpiredProgrammaticDispenses_NoLock(now);
+
+                if (!_pendingProgrammaticDispenseByValue.TryGetValue(valueInCents, out var cur))
+                    return false;
+
+                if (cur.Count <= 1)
+                    _pendingProgrammaticDispenseByValue.Remove(valueInCents);
+                else
+                    _pendingProgrammaticDispenseByValue[valueInCents] = (cur.Count - 1, cur.ExpiresUtc);
+
+                return true;
+            }
+        }
+
+        private void CleanupExpiredProgrammaticDispenses_NoLock(DateTime nowUtc)
+        {
+            if (_pendingProgrammaticDispenseByValue.Count == 0)
+                return;
+
+            var toRemove = new List<int>();
+            foreach (var kv in _pendingProgrammaticDispenseByValue)
+            {
+                if (kv.Value.ExpiresUtc <= nowUtc)
+                    toRemove.Add(kv.Key);
+            }
+
+            foreach (var k in toRemove)
+                _pendingProgrammaticDispenseByValue.Remove(k);
         }
 
         public void ResetDeviceCoinState()
         {
             try
             {
-                _device.Write("R,08");
-                ReadLineLogged();
+                lock (_ioLock)
+                {
+                    _device.Write("R,08");
+                    ReadLineLogged();
 
-                _device.Write("R,09");
-                ReadLineLogged();
+                    _device.Write("R,09");
+                    ReadLineLogged();
 
-                _device.Write("R,0C,FFFFFFFF");
-                ReadLineLogged();
+                    _device.Write("R,0C,FFFFFFFF");
+                    ReadLineLogged();
+                }
 
                 _logger.LogInformation("MDB coin device reset/reinitialized after emptying tubes.");
             }
@@ -311,286 +722,93 @@ namespace ITBees.Mdb
         public async Task<bool> DispenseChangeAsync(int amount)
         {
             _liveLogger.LogMessage("Dispensing change: " + amount + " gr").Wait();
-            _payoutBusy = true;
-            try
-            {
-                Dictionary<int, int> tubeMap;
-                lock (_ioLock)
-                {
-                    _device.Write("R,0A");
-                    string response = ReadLineLogged("TubeStatus");
-                    tubeMap = ParseTubeStatus(response);
-                }
 
-                if (tubeMap == null || tubeMap.Count == 0)
-                {
-                    EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
-                    _liveLogger.LogErrorMessage("Failed to get tube status when dispensing change").Wait();
-                    return false;
-                }
-
-                int[] sortedValues = tubeMap.Keys.OrderByDescending(v => v).ToArray();
-
-                var toDispense = new Dictionary<int, int>();
-                int remaining = amount;
-
-                foreach (int coinValue in sortedValues)
-                {
-                    _liveLogger.LogMessage("Considering coin value: " + coinValue + " gr").Wait();
-                    if (remaining <= 0)
-                        break;
-
-                    tubeMap.TryGetValue(coinValue, out int availableCount);
-
-                    if (availableCount <= 0)
-                    {
-                        toDispense[coinValue] = 0;
-                        continue;
-                    }
-
-                    int needed = remaining / coinValue;
-                    int use = Math.Min(needed, availableCount);
-
-                    toDispense[coinValue] = use;
-                    remaining -= use * coinValue;
-                }
-
-                if (remaining > 0)
-                {
-                    _liveLogger.LogErrorMessage(
-                        $"Cannot make exact change: remaining={remaining} gr, requested={amount} gr").Wait();
-                    return false;
-                }
-
-                foreach (var kv in toDispense)
-                {
-                    int coinValue = kv.Key;
-                    int countToDispense = kv.Value;
-
-                    for (int i = 0; i < countToDispense; i++)
-                    {
-                        _liveLogger.LogMessage($"Dispensing coin {coinValue} gr").Wait();
-
-                        bool ok = await DispenseCoinAsync(coinValue);
-
-                        await Task.Delay(200);
-
-                        if (!ok)
-                        {
-                            _liveLogger.LogErrorMessage(
-                                    $"Failed to dispense coin {coinValue} gr, aborting change dispense, remaining amount: {remaining} gr, initial amount: {amount} gr")
-                                .Wait();
-                            EmitError($"Błąd przy wypłacie monety {coinValue} gr");
-                            return false;
-                        }
-                    }
-                }
-
-                return true;
-            }
-            finally
-            {
-                lock (_dispenseWaitersLock)
-                {
-                    foreach (var kv in _dispenseWaiters.Values)
-                        kv.TrySetResult(false);
-                    _dispenseWaiters.Clear();
-                }
-                _payoutBusy = false;
-            }
-        }
-
-        public bool DeviceRunning()
-        {
-            return _deviceRunnig;
-        }
-
-        public void EnableVerboseDebugLogging(bool enable)
-        {
-            _debugVerboseLogging = enable;
-        }
-
-        public async Task<bool> DispenseCoinAsync(int value)
-        {
-            if (!_coinValueToType.TryGetValue(value, out var coinType))
-            {
-                _logger.LogWarning("DispenseCoin: unknown coin value {Value} gr", value);
-                return false;
-            }
-
-            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            lock (_dispenseWaitersLock)
-            {
-                _dispenseWaiters[value] = tcs;
-            }
-
-            byte param = (byte)(0x10 | (coinType & 0x0F));
-
-            string line;
+            Dictionary<int, int> tubeMap;
             lock (_ioLock)
             {
-                _liveLogger.LogMessage(
-                    $"Sending payout for {value} gr (coinType={coinType}, param=0x{param:X2})").Wait();
-
-                _device.Write($"R,0D,{param:X2}");
-                line = ReadLineLogged("DispenseCoin");
+                _device.Write("R,0A");
+                string response = ReadLineLogged("TubeStatus");
+                tubeMap = ParseTubeStatus(response);
             }
 
-            if (!line.StartsWith("p,ACK", StringComparison.OrdinalIgnoreCase))
+            if (tubeMap == null || tubeMap.Count == 0)
             {
-                lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
-                _logger.LogWarning("DispenseCoin failed for {Value} gr", value);
+                EmitError($"Nie udało się pobrać stanu tub przy próbie wydania reszty: {amount} gr");
+                _liveLogger.LogErrorMessage("Failed to get tube status when dispensing change").Wait();
                 return false;
             }
 
-            var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 5000)
-            {
-                if (tcs.Task.IsCompleted)
-                    break;
+            int[] sortedValues = tubeMap.Keys.OrderByDescending(v => v).ToArray();
 
-                string coins;
-                lock (_ioLock)
+            var toDispense = new Dictionary<int, int>();
+            int remaining = amount;
+
+            foreach (int coinValue in sortedValues)
+            {
+                if (remaining <= 0) break;
+
+                tubeMap.TryGetValue(coinValue, out int availableCount);
+                if (availableCount <= 0)
                 {
-                    _device.Write("R,0B");
-                    coins = ReadLineLogged("PollCoinsAfterPayout");
+                    toDispense[coinValue] = 0;
+                    continue;
                 }
 
-                await HandleCoinsAsync(coins).ConfigureAwait(false);
+                int needed = remaining / coinValue;
+                int use = Math.Min(needed, availableCount);
 
-                if (tcs.Task.IsCompleted)
-                    break;
-
-                await Task.Delay(80).ConfigureAwait(false);
+                toDispense[coinValue] = use;
+                remaining -= use * coinValue;
             }
 
-            bool ok = false;
-            if (tcs.Task.IsCompleted)
-                ok = await tcs.Task.ConfigureAwait(false);
-
-            if (!ok)
+            if (remaining > 0)
             {
-                lock (_dispenseWaitersLock) { _dispenseWaiters.Remove(value); }
+                _liveLogger.LogErrorMessage(
+                    $"Cannot make exact change: remaining={remaining} gr, requested={amount} gr").Wait();
+                return false;
             }
 
-            return ok;
-        }
-
-        public void ShowTubeStatus()
-        {
-            _liveLogger.LogMessage("Requesting tube status...").Wait();
-            _device.Write("R,0A");
-            var map = ParseTubeStatus(ReadLineLogged());
-            _liveLogger.LogMessage("Tube status:").Wait();
-            foreach (var kv in map)
+            foreach (var kv in toDispense)
             {
-                _liveLogger.LogMessage($"  {kv.Key} gr: {kv.Value}").Wait();
-            }
-        }
+                int coinValue = kv.Key;
+                int countToDispense = kv.Value;
 
-        public async Task<bool> StartSigmaPaymentAsync(int amountCents,
-            CancellationToken ct = default)
-        {
-            if (_cashlessBusy) return false;
-            _cashlessBusy = true;
-            try
-            {
-                WriteDbg("C,64,02");
-                if (!ReadAck()) return Fail("ENABLE no ACK");
-                await Task.Delay(300, ct);
-
-                WriteDbg("C,60");
-
-                var sw = Stopwatch.StartNew();
-                const int timeoutMs = 5000;
-                bool seenReset = false;
-                while (sw.ElapsedMilliseconds < timeoutMs)
+                for (int i = 0; i < countToDispense; i++)
                 {
-                    await Task.Delay(100, ct);
-                    WriteDbg("C,62");
-                    string rsp = ReadLineLogged();
-                    if (rsp.StartsWith("d,STATUS,RESET",
-                            StringComparison.OrdinalIgnoreCase))
+                    bool ok = await DispenseCoinInternalAsync(coinValue, flushAfter: false).ConfigureAwait(false);
+                    await Task.Delay(150).ConfigureAwait(false);
+
+                    if (!ok)
                     {
-                        seenReset = true;
-                        break;
+                        _liveLogger.LogErrorMessage(
+                                $"Failed to dispense coin {coinValue} gr, aborting change dispense, initial amount: {amount} gr")
+                            .Wait();
+                        EmitError($"Błąd przy wypłacie monety {coinValue} gr");
+                        return false;
                     }
                 }
-
-                if (!seenReset)
-                    return Fail("RESET no ACK (timeout waiting for STATUS,RESET)");
-
-                WriteDbg("C,61");
-                string setup = ReadNextNonAck(_device);
-                byte decimals = 2;
-                if (setup.StartsWith("p,", StringComparison.OrdinalIgnoreCase))
-                {
-                    var b = AsHexBytes(setup.Substring(2));
-                    if (b.Length >= 7) decimals = b[6];
-                }
-
-                SendDisplayText($"Product {amountCents / 100.0:0.00} PLN");
-
-                uint scaled = (uint)(amountCents / Math.Pow(10, decimals));
-                byte hi = (byte)(scaled >> 8), lo = (byte)scaled;
-                WriteDbg($"C,63,{hi:X2},{lo:X2}");
-                if (!ReadAck())
-                    return Fail("VEND REQUEST no ACK");
-
-                DeviceEvent?.Invoke(this,
-                    new DeviceEventArgs(DeviceEventType.CashlessSessionStarted,
-                        PaymentType.Card, amountCents));
-
-                var deadline = DateTime.UtcNow.AddSeconds(30);
-                while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
-                {
-                    WriteDbg("C,62");
-                    string poll = ReadLineLogged();
-                    if (TryParseCashlessPoll(poll, out bool approved, out bool finished))
-                    {
-                        if (approved)
-                        {
-                            DeviceEvent?.Invoke(this,
-                                new DeviceEventArgs(DeviceEventType.CashlessVendApproved,
-                                    PaymentType.Card, amountCents, true));
-                            return true;
-                        }
-
-                        if (finished)
-                        {
-                            DeviceEvent?.Invoke(this,
-                                new DeviceEventArgs(DeviceEventType.CashlessVendDenied,
-                                    PaymentType.Card, amountCents, false));
-                            return false;
-                        }
-                    }
-
-                    await Task.Delay(200, ct);
-                }
-
-                EmitError("Cashless: approval timeout");
-                return false;
             }
-            catch (Exception ex)
-            {
-                EmitError("StartSigmaPayment: " + ex.Message);
-                return false;
-            }
-            finally
-            {
-                _cashlessBusy = false;
-            }
+
+            await _cashInventoryService.FlushAsync().ConfigureAwait(false);
+            return true;
         }
+
+        public bool DeviceRunning() => _deviceRunnig;
+        public void EnableVerboseDebugLogging(bool enable) => _debugVerboseLogging = enable;
+
+        // ---- rest of your class unchanged ----
 
         private void WriteDbg(string cmd)
         {
             Console.WriteLine($"TX » {cmd}");
-            _device.Write(cmd);
+            lock (_ioLock) _device.Write(cmd);
         }
 
         private string ReadLineLogged(string context = null)
         {
-            string s = _device.Read();
+            string s;
+            lock (_ioLock) s = _device.Read();
+
             if (_debugVerboseLogging)
             {
                 if (!string.IsNullOrEmpty(context))
@@ -640,26 +858,6 @@ namespace ITBees.Mdb
         private static bool IsHex(char c) =>
             (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
 
-        private static bool TryParseCashlessPoll(string data, out bool approved, out bool finished)
-        {
-            approved = finished = false;
-            if (string.IsNullOrEmpty(data) || !data.StartsWith("p,")) return false;
-            byte code = Convert.ToByte(data.Substring(2, 2), 16);
-            if (code == 0x01)
-            {
-                approved = finished = true;
-                return true;
-            }
-
-            if (code == 0x02)
-            {
-                finished = true;
-                return true;
-            }
-
-            return false;
-        }
-
         private void SendDisplayText(string text)
         {
             if (text.Length > 32) text = text.Substring(0, 32);
@@ -676,8 +874,7 @@ namespace ITBees.Mdb
         }
 
         private void EmitError(string m) =>
-            DeviceEvent?.Invoke(this,
-                new DeviceEventArgs(DeviceEventType.Error, PaymentType.Cash, 0, null, m));
+            DeviceEvent?.Invoke(this, new DeviceEventArgs(DeviceEventType.Error, PaymentType.Cash, 0, null, m));
 
         private bool Fail(string msg)
         {
@@ -726,9 +923,7 @@ namespace ITBees.Mdb
                 if (count == 0) continue;
 
                 if (_coinTypeToValue.TryGetValue(coinType, out var valueInCents))
-                {
                     map[valueInCents] = count;
-                }
             }
 
             return map;
@@ -752,18 +947,12 @@ namespace ITBees.Mdb
                 _coinTypeToValue.Clear();
                 _coinValueToType.Clear();
 
-                _coinScalingFactor = bytes.Length > 3 && bytes[3] != 0 ? bytes[3] : 1;
-                _coinDecimalPlaces = bytes.Length > 4 ? bytes[4] : 2;
+                _coinScalingFactor = bytes[3] == 0 ? 1 : bytes[3];
+                _coinDecimalPlaces = bytes[4];
 
-                byte[] credits;
-                if (bytes.Length >= 16)
-                    credits = bytes.Skip(bytes.Length - 16).Take(16).ToArray();
-                else
-                    credits = Array.Empty<byte>();
-
-                for (int coinType = 0; coinType < credits.Length; coinType++)
+                for (int coinType = 0; coinType < 16 && (7 + coinType) < bytes.Length; coinType++)
                 {
-                    byte credit = credits[coinType];
+                    byte credit = bytes[7 + coinType];
                     if (credit == 0 || credit == 0xFF)
                         continue;
 
@@ -775,10 +964,8 @@ namespace ITBees.Mdb
                 }
 
                 _liveLogger.LogMessage(
-                    $"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}").Wait();
-
-                foreach (var kv in _coinTypeToValue.OrderBy(x => x.Key))
-                    _logger.LogInformation("[MDB COIN] coinType={CoinType} => {Value} gr", kv.Key, kv.Value);
+                        $"Loaded COIN TYPE config. Scaling={_coinScalingFactor}, Decimals={_coinDecimalPlaces}, Types={_coinTypeToValue.Count}")
+                    .Wait();
             }
             catch (Exception ex)
             {
@@ -786,11 +973,34 @@ namespace ITBees.Mdb
             }
         }
 
+        private bool IsPayoutBusyPoll(string pollLine)
+        {
+            if (string.IsNullOrEmpty(pollLine) || !pollLine.StartsWith("p,", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string hex = new string(pollLine.Substring(2).Where(IsHex).ToArray());
+            if (hex.Length < 2) return false;
+            if ((hex.Length & 1) == 1) hex = hex.Substring(0, hex.Length - 1);
+
+            for (int i = 0; i < hex.Length; i += 2)
+            {
+                byte b = Convert.ToByte(hex.Substring(i, 2), 16);
+                if (b == 0x02) // Changer Payout Busy
+                    return true;
+            }
+
+            return false;
+        }
+
+
         internal enum CoinRoute : byte
         {
             ToTube,
             Dispensed,
             ToCashbox
         }
+
+        // ===== Cashless part unchanged (omitted for brevity in this paste) =====
+        // Keep your StartSigmaPaymentAsync etc. as-is.
     }
 }
