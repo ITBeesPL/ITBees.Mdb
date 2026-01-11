@@ -7,6 +7,8 @@ public class CashInventoryStateVm
     public List<Coin> Coins { get; set; } = new();
     public List<Coin> CoinsInCashbox { get; set; } = new();
     public DateTime LastUpdatedUtc { get; set; }
+    public Guid? AgentGuid { get; set; }
+    public string? Auth { get; set; }
 }
 
 public class Banknote
